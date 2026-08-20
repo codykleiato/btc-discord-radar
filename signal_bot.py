@@ -10,13 +10,13 @@ from datetime import datetime, timezone
 
 # ============================================================
 # PKLA BTC DISCORD RADAR
-# FREE AUTOMATED VERSION
+# ============================================================
 #
 # BTC DATA  -> BINANCE
 # ANALYSIS  -> EMA + RSI + MACD + VOLUME + BREAKOUT
 # OUTPUT    -> DISCORD WEBHOOK
 #
-# NO TRADINGVIEW PAID WEBHOOK REQUIRED
+# TRADINGVIEW WEBHOOK NOT REQUIRED
 # ============================================================
 
 
@@ -24,11 +24,24 @@ from datetime import datetime, timezone
 # ENVIRONMENT VARIABLES
 # ============================================================
 
-DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
+DISCORD_WEBHOOK = os.environ.get(
+    "DISCORD_WEBHOOK",
+    ""
+).strip()
 
-SEND_NO_TRADE = os.environ.get("SEND_NO_TRADE", "0") == "1"
+SEND_NO_TRADE = (
+    os.environ.get(
+        "SEND_NO_TRADE",
+        "0"
+    ) == "1"
+)
 
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "10"))
+CHECK_INTERVAL = int(
+    os.environ.get(
+        "CHECK_INTERVAL",
+        "10"
+    )
+)
 
 SYMBOL = "BTCUSDT"
 
@@ -46,6 +59,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
+
     return {
         "status": "online",
         "service": "btc-discord-radar"
@@ -60,6 +74,7 @@ def home():
 def test_discord():
 
     embed = {
+
         "title": "🧪 PKLA BTC Radar Test",
 
         "description": (
@@ -78,7 +93,10 @@ def test_discord():
         ).isoformat()
     }
 
-    success, error_detail = send_discord(embed, return_error=True)
+    success, error_detail = send_discord(
+        embed,
+        return_error=True
+    )
 
     if success:
 
@@ -99,8 +117,13 @@ def start_web_server():
     port = int(
         os.environ.get(
             "PORT",
-            10000
+            "10000"
         )
+    )
+
+    print(
+        f"Starting web server on port {port}...",
+        flush=True
     )
 
     app.run(
@@ -151,14 +174,20 @@ def get_json(url):
 def ema(values, period):
 
     if not values:
+
         return []
 
     if len(values) < period:
+
         return [values[0]] * len(values)
 
-    multiplier = 2.0 / (period + 1.0)
+    multiplier = 2.0 / (
+        period + 1.0
+    )
 
-    result = [values[0]]
+    result = [
+        values[0]
+    ]
 
     for price in values[1:]:
 
@@ -180,14 +209,22 @@ def ema(values, period):
 def rsi(values, period=14):
 
     if len(values) < period + 1:
+
         return 50.0
 
     gains = []
+
     losses = []
 
-    for i in range(1, len(values)):
+    for i in range(
+        1,
+        len(values)
+    ):
 
-        change = values[i] - values[i - 1]
+        change = (
+            values[i]
+            - values[i - 1]
+        )
 
         gains.append(
             max(change, 0.0)
@@ -197,40 +234,56 @@ def rsi(values, period=14):
             max(-change, 0.0)
         )
 
-    avg_gain = sum(
-        gains[:period]
-    ) / period
+    avg_gain = (
+        sum(gains[:period])
+        / period
+    )
 
-    avg_loss = sum(
-        losses[:period]
-    ) / period
+    avg_loss = (
+        sum(losses[:period])
+        / period
+    )
 
-    for i in range(period, len(gains)):
+    for i in range(
+        period,
+        len(gains)
+    ):
 
         avg_gain = (
-            (avg_gain * (period - 1))
+            (
+                avg_gain
+                * (period - 1)
+            )
             + gains[i]
         ) / period
 
         avg_loss = (
-            (avg_loss * (period - 1))
+            (
+                avg_loss
+                * (period - 1)
+            )
             + losses[i]
         ) / period
 
     if avg_loss == 0:
 
         if avg_gain == 0:
+
             return 50.0
 
         return 100.0
 
     relative_strength = (
-        avg_gain / avg_loss
+        avg_gain
+        / avg_loss
     )
 
     return 100.0 - (
         100.0
-        / (1.0 + relative_strength)
+        / (
+            1.0
+            + relative_strength
+        )
     )
 
 
@@ -251,7 +304,9 @@ def macd(values):
     )
 
     macd_line = [
+
         a - b
+
         for a, b in zip(
             ema12,
             ema26
@@ -264,6 +319,7 @@ def macd(values):
     )
 
     if not macd_line:
+
         return 0.0, 0.0
 
     return (
@@ -276,20 +332,37 @@ def macd(values):
 # DISCORD
 # ============================================================
 
-def send_discord(embed, return_error=False):
+def send_discord(
+    embed,
+    return_error=False
+):
 
     if not DISCORD_WEBHOOK:
 
-        error = "DISCORD_WEBHOOK is missing or empty."
-        print("Discord error:", error)
-        return (False, error) if return_error else False
+        error = (
+            "DISCORD_WEBHOOK is missing or empty."
+        )
+
+        print(
+            "Discord error:",
+            error,
+            flush=True
+        )
+
+        if return_error:
+
+            return False, error
+
+        return False
 
     payload = {
         "username": "Cash Gang BTC Radar",
         "embeds": [embed]
     }
 
-    data = json.dumps(payload).encode("utf-8")
+    data = json.dumps(
+        payload
+    ).encode("utf-8")
 
     request = urllib.request.Request(
         DISCORD_WEBHOOK,
@@ -302,30 +375,102 @@ def send_discord(embed, return_error=False):
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
+
+        with urllib.request.urlopen(
+            request,
+            timeout=15
+        ) as response:
+
             status = response.status
-            print("Discord response:", status)
+
+            print(
+                "Discord response:",
+                status,
+                flush=True
+            )
+
             if 200 <= status < 300:
-                return (True, None) if return_error else True
-            error = f"Discord returned HTTP {status}"
-            print("Discord error:", error)
-            return (False, error) if return_error else False
+
+                return (
+                    (True, None)
+                    if return_error
+                    else True
+                )
+
+            error = (
+                f"Discord returned HTTP {status}"
+            )
+
+            print(
+                "Discord error:",
+                error,
+                flush=True
+            )
+
+            return (
+                (False, error)
+                if return_error
+                else False
+            )
 
     except urllib.error.HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
-        detail = f"HTTP {error.code}: {body}"
-        print("Discord error:", detail)
-        return (False, detail) if return_error else False
+
+        body = error.read().decode(
+            "utf-8",
+            errors="replace"
+        )
+
+        detail = (
+            f"HTTP {error.code}: {body}"
+        )
+
+        print(
+            "Discord error:",
+            detail,
+            flush=True
+        )
+
+        return (
+            (False, detail)
+            if return_error
+            else False
+        )
 
     except urllib.error.URLError as error:
-        detail = f"URL error: {error.reason}"
-        print("Discord error:", detail)
-        return (False, detail) if return_error else False
+
+        detail = (
+            f"URL error: {error.reason}"
+        )
+
+        print(
+            "Discord error:",
+            detail,
+            flush=True
+        )
+
+        return (
+            (False, detail)
+            if return_error
+            else False
+        )
 
     except Exception as error:
-        detail = f"{type(error).__name__}: {error}"
-        print("Discord error:", detail)
-        return (False, detail) if return_error else False
+
+        detail = (
+            f"{type(error).__name__}: {error}"
+        )
+
+        print(
+            "Discord error:",
+            detail,
+            flush=True
+        )
+
+        return (
+            (False, detail)
+            if return_error
+            else False
+        )
 
 
 # ============================================================
@@ -333,6 +478,11 @@ def send_discord(embed, return_error=False):
 # ============================================================
 
 def get_btc_candles():
+
+    print(
+        "Requesting BTC candles from Binance...",
+        flush=True
+    )
 
     candles = get_json(
         BINANCE_URL
@@ -343,6 +493,11 @@ def get_btc_candles():
         raise RuntimeError(
             "Binance returned no candles."
         )
+
+    print(
+        f"Binance returned {len(candles)} candles.",
+        flush=True
+    )
 
     return candles
 
@@ -465,17 +620,25 @@ def analyze_btc():
         / candle_range
     )
 
-    bullish_candle = price > current_open
+    bullish_candle = (
+        price > current_open
+    )
 
-    bearish_candle = price < current_open
+    bearish_candle = (
+        price < current_open
+    )
 
     recent_change = (
         price - closes[-4]
     )
 
-    bullish_momentum = recent_change > 0
+    bullish_momentum = (
+        recent_change > 0
+    )
 
-    bearish_momentum = recent_change < 0
+    bearish_momentum = (
+        recent_change < 0
+    )
 
     previous_highs = highs[-21:-1]
 
@@ -615,7 +778,10 @@ def analyze_btc():
 
     if candle_range > 0:
 
-        if bullish_candle and close_position >= 0.70:
+        if (
+            bullish_candle
+            and close_position >= 0.70
+        ):
 
             bullish_score += 1
 
@@ -623,7 +789,10 @@ def analyze_btc():
                 "🟢 Strong bullish candle close"
             )
 
-        elif bearish_candle and close_position <= 0.30:
+        elif (
+            bearish_candle
+            and close_position <= 0.30
+        ):
 
             bearish_score += 1
 
@@ -697,7 +866,10 @@ def analyze_btc():
 
         direction = "NONE"
 
-    if direction in ("UP", "DOWN"):
+    if direction in (
+        "UP",
+        "DOWN"
+    ):
 
         confidence = (
             50
@@ -731,9 +903,14 @@ def analyze_btc():
         hold_candles = 1
 
     recent_ranges = [
+
         highs[i] - lows[i]
+
         for i in range(
-            max(0, len(highs) - 14),
+            max(
+                0,
+                len(highs) - 14
+            ),
             len(highs)
         )
     ]
@@ -793,30 +970,55 @@ def analyze_btc():
     )
 
     return {
+
         "price": price,
+
         "signal": signal,
+
         "direction": direction,
+
         "confidence": confidence,
+
         "bullish_score": bullish_score,
+
         "bearish_score": bearish_score,
+
         "score_gap": score_gap,
+
         "rsi": current_rsi,
+
         "macd": macd_value,
+
         "macd_signal": macd_signal,
+
         "ema9": ema9,
+
         "ema21": ema21,
+
         "ema40": ema40,
+
         "relative_volume": relative_volume,
+
         "previous_high": previous_high,
+
         "previous_low": previous_low,
+
         "breakout_up": breakout_up,
+
         "breakout_down": breakout_down,
+
         "entry": entry,
+
         "take_profit": take_profit,
+
         "stop_loss": stop_loss,
+
         "hold_candles": hold_candles,
+
         "reasons": reasons,
+
         "candle_timestamp": candle_timestamp,
+
         "candle_datetime": candle_datetime
     }
 
@@ -892,7 +1094,9 @@ def build_embed(result):
 
             {
                 "name": "🕯 HOLD",
-                "value": f"**{result['hold_candles']} candle(s)**",
+                "value": (
+                    f"**{result['hold_candles']} candle(s)**"
+                ),
                 "inline": True
             },
 
@@ -973,13 +1177,19 @@ def send_signal(result):
     ):
 
         print(
-            "NO TRADE signal - Discord message skipped."
+            "NO TRADE signal - Discord message skipped.",
+            flush=True
         )
 
         return
 
     embed = build_embed(
         result
+    )
+
+    print(
+        "Sending signal to Discord...",
+        flush=True
     )
 
     success = send_discord(
@@ -989,7 +1199,15 @@ def send_signal(result):
     if success:
 
         print(
-            "Signal successfully sent to Discord."
+            "Signal successfully sent to Discord.",
+            flush=True
+        )
+
+    else:
+
+        print(
+            "Signal was NOT sent to Discord.",
+            flush=True
         )
 
 
@@ -1000,52 +1218,81 @@ def send_signal(result):
 def run_radar():
 
     print(
-        "=========================================="
+        "==========================================",
+        flush=True
     )
 
     print(
-        "       PKLA BTC DISCORD RADAR"
+        "       PKLA BTC DISCORD RADAR",
+        flush=True
     )
 
     print(
-        "=========================================="
+        "==========================================",
+        flush=True
     )
 
     print(
-        "Data: Binance"
+        "Data: Binance",
+        flush=True
     )
 
     print(
-        "Timeframe: 15M"
+        "Timeframe: 15M",
+        flush=True
     )
 
     print(
-        "TradingView webhook: NOT REQUIRED"
+        "TradingView webhook: NOT REQUIRED",
+        flush=True
     )
 
     print(
-        "Discord: ENABLED"
+        "Discord: ENABLED",
+        flush=True
     )
 
     print(
-        "=========================================="
+        "Check interval:",
+        f"{CHECK_INTERVAL}s",
+        flush=True
     )
 
-    if not DISCORD_WEBHOOK:
+    print(
+        "==========================================",
+        flush=True
+    )
+
+    if DISCORD_WEBHOOK:
 
         print(
-            "WARNING:"
+            "Discord webhook: CONFIGURED",
+            flush=True
+        )
+
+    else:
+
+        print(
+            "WARNING:",
+            flush=True
         )
 
         print(
             "DISCORD_WEBHOOK environment variable "
-            "has not been configured."
+            "has not been configured.",
+            flush=True
         )
 
         print(
             "The bot will analyze BTC but "
-            "cannot send Discord messages."
+            "cannot send Discord messages.",
+            flush=True
         )
+
+    print(
+        "Radar thread started.",
+        flush=True
+    )
 
     last_processed_candle = None
 
@@ -1053,12 +1300,18 @@ def run_radar():
 
         try:
 
+            print(
+                "Checking Binance for new closed candle...",
+                flush=True
+            )
+
             candles = get_btc_candles()
 
             if len(candles) < 3:
 
                 print(
-                    "Not enough Binance data."
+                    "Not enough Binance data.",
+                    flush=True
                 )
 
                 time.sleep(
@@ -1073,10 +1326,26 @@ def run_radar():
                 latest_closed[0]
             )
 
+            candle_datetime = datetime.fromtimestamp(
+                candle_timestamp / 1000,
+                tz=timezone.utc
+            )
+
+            print(
+                "Latest closed candle:",
+                candle_datetime.isoformat(),
+                flush=True
+            )
+
             if (
                 last_processed_candle
                 == candle_timestamp
             ):
+
+                print(
+                    "No new closed 15M candle yet.",
+                    flush=True
+                )
 
                 time.sleep(
                     CHECK_INTERVAL
@@ -1085,38 +1354,56 @@ def run_radar():
                 continue
 
             print(
-                "\nNew closed 15M candle detected."
+                "",
+                flush=True
             )
 
             print(
-                "Analyzing BTC..."
+                "New closed 15M candle detected!",
+                flush=True
+            )
+
+            print(
+                "Analyzing BTC...",
+                flush=True
             )
 
             result = analyze_btc()
 
             print(
                 "Price:",
-                f"${result['price']:,.2f}"
+                f"${result['price']:,.2f}",
+                flush=True
             )
 
             print(
                 "Signal:",
-                result["signal"]
+                result["signal"],
+                flush=True
             )
 
             print(
                 "Confidence:",
-                f"{result['confidence']}%"
+                f"{result['confidence']}%",
+                flush=True
             )
 
             print(
                 "Bullish score:",
-                result["bullish_score"]
+                result["bullish_score"],
+                flush=True
             )
 
             print(
                 "Bearish score:",
-                result["bearish_score"]
+                result["bearish_score"],
+                flush=True
+            )
+
+            print(
+                "Candle analyzed:",
+                result["candle_datetime"].isoformat(),
+                flush=True
             )
 
             send_signal(
@@ -1127,25 +1414,33 @@ def run_radar():
                 candle_timestamp
             )
 
+            print(
+                "Candle processing complete.",
+                flush=True
+            )
+
         except urllib.error.HTTPError as error:
 
             print(
                 "HTTP error:",
-                error
+                error,
+                flush=True
             )
 
         except urllib.error.URLError as error:
 
             print(
                 "Network error:",
-                error
+                error,
+                flush=True
             )
 
         except Exception as error:
 
             print(
                 "Radar error:",
-                repr(error)
+                repr(error),
+                flush=True
             )
 
         time.sleep(
@@ -1158,6 +1453,11 @@ def run_radar():
 # ============================================================
 
 if __name__ == "__main__":
+
+    print(
+        "Starting PKLA BTC Discord Radar...",
+        flush=True
+    )
 
     # Start Flask so Render detects an open port.
     threading.Thread(
