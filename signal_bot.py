@@ -3,7 +3,6 @@ import json
 import time
 import urllib.request
 import urllib.error
-import threading
 from flask import Flask
 from datetime import datetime, timezone
 
@@ -60,17 +59,17 @@ def home():
 def test_discord():
 
     embed = {
-        "title": "🧪 PKLA BTC Radar Test",
+        "title": "ðŸ§ª PKLA BTC Radar Test",
 
         "description": (
             "Discord connection successful!\n\n"
-            "Render → PKLA Bot → Discord is working."
+            "Render â†’ PKLA Bot â†’ Discord is working."
         ),
 
         "color": 5763719,
 
         "footer": {
-            "text": "PKLA Signal Hub • Connection Test"
+            "text": "PKLA Signal Hub â€¢ Connection Test"
         },
 
         "timestamp": datetime.now(
@@ -94,14 +93,9 @@ def test_discord():
 
 
 def start_web_server():
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
-    )
-
+    # Kept for local `python signal_bot.py` use.
+    # Render should use Gunicorn instead.
+    port = int(os.environ.get("PORT", "10000"))
     app.run(
         host="0.0.0.0",
         port=port
@@ -517,7 +511,7 @@ def analyze_btc():
         bullish_score += 2
 
         reasons.append(
-            "🟢 EMA9 > EMA21"
+            "ðŸŸ¢ EMA9 > EMA21"
         )
 
     else:
@@ -525,7 +519,7 @@ def analyze_btc():
         bearish_score += 2
 
         reasons.append(
-            "🔴 EMA9 < EMA21"
+            "ðŸ”´ EMA9 < EMA21"
         )
 
     if price > ema40:
@@ -533,7 +527,7 @@ def analyze_btc():
         bullish_score += 2
 
         reasons.append(
-            "🟢 BTC above EMA40"
+            "ðŸŸ¢ BTC above EMA40"
         )
 
     else:
@@ -541,7 +535,7 @@ def analyze_btc():
         bearish_score += 2
 
         reasons.append(
-            "🔴 BTC below EMA40"
+            "ðŸ”´ BTC below EMA40"
         )
 
     if current_rsi >= 55:
@@ -549,7 +543,7 @@ def analyze_btc():
         bullish_score += 2
 
         reasons.append(
-            f"🟢 RSI bullish ({current_rsi:.1f})"
+            f"ðŸŸ¢ RSI bullish ({current_rsi:.1f})"
         )
 
     elif current_rsi <= 45:
@@ -557,7 +551,7 @@ def analyze_btc():
         bearish_score += 2
 
         reasons.append(
-            f"🔴 RSI bearish ({current_rsi:.1f})"
+            f"ðŸ”´ RSI bearish ({current_rsi:.1f})"
         )
 
     elif current_rsi > 50:
@@ -565,7 +559,7 @@ def analyze_btc():
         bullish_score += 1
 
         reasons.append(
-            f"🟢 RSI slightly bullish ({current_rsi:.1f})"
+            f"ðŸŸ¢ RSI slightly bullish ({current_rsi:.1f})"
         )
 
     else:
@@ -573,7 +567,7 @@ def analyze_btc():
         bearish_score += 1
 
         reasons.append(
-            f"🔴 RSI slightly bearish ({current_rsi:.1f})"
+            f"ðŸ”´ RSI slightly bearish ({current_rsi:.1f})"
         )
 
     if macd_value > macd_signal:
@@ -581,7 +575,7 @@ def analyze_btc():
         bullish_score += 2
 
         reasons.append(
-            "🟢 MACD bullish"
+            "ðŸŸ¢ MACD bullish"
         )
 
     else:
@@ -589,7 +583,7 @@ def analyze_btc():
         bearish_score += 2
 
         reasons.append(
-            "🔴 MACD bearish"
+            "ðŸ”´ MACD bearish"
         )
 
     if relative_volume >= 1.15:
@@ -599,7 +593,7 @@ def analyze_btc():
             bullish_score += 2
 
             reasons.append(
-                f"🟢 Strong bullish volume ({relative_volume:.2f}x)"
+                f"ðŸŸ¢ Strong bullish volume ({relative_volume:.2f}x)"
             )
 
         elif bearish_candle:
@@ -607,19 +601,19 @@ def analyze_btc():
             bearish_score += 2
 
             reasons.append(
-                f"🔴 Strong bearish volume ({relative_volume:.2f}x)"
+                f"ðŸ”´ Strong bearish volume ({relative_volume:.2f}x)"
             )
 
     elif relative_volume < 0.80:
 
         reasons.append(
-            f"⚪ Low volume ({relative_volume:.2f}x)"
+            f"âšª Low volume ({relative_volume:.2f}x)"
         )
 
     else:
 
         reasons.append(
-            f"⚪ Normal volume ({relative_volume:.2f}x)"
+            f"âšª Normal volume ({relative_volume:.2f}x)"
         )
 
     if candle_range > 0:
@@ -629,7 +623,7 @@ def analyze_btc():
             bullish_score += 1
 
             reasons.append(
-                "🟢 Strong bullish candle close"
+                "ðŸŸ¢ Strong bullish candle close"
             )
 
         elif bearish_candle and close_position <= 0.30:
@@ -637,7 +631,7 @@ def analyze_btc():
             bearish_score += 1
 
             reasons.append(
-                "🔴 Strong bearish candle close"
+                "ðŸ”´ Strong bearish candle close"
             )
 
     if bullish_momentum:
@@ -645,7 +639,7 @@ def analyze_btc():
         bullish_score += 1
 
         reasons.append(
-            "🟢 Short-term momentum UP"
+            "ðŸŸ¢ Short-term momentum UP"
         )
 
     elif bearish_momentum:
@@ -653,7 +647,7 @@ def analyze_btc():
         bearish_score += 1
 
         reasons.append(
-            "🔴 Short-term momentum DOWN"
+            "ðŸ”´ Short-term momentum DOWN"
         )
 
     if breakout_up:
@@ -661,7 +655,7 @@ def analyze_btc():
         bullish_score += 3
 
         reasons.append(
-            "🚀 Upside range breakout"
+            "ðŸš€ Upside range breakout"
         )
 
     elif breakout_down:
@@ -669,7 +663,7 @@ def analyze_btc():
         bearish_score += 3
 
         reasons.append(
-            "📉 Downside range breakout"
+            "ðŸ“‰ Downside range breakout"
         )
 
     score_gap = abs(
@@ -687,7 +681,7 @@ def analyze_btc():
         and bullish_score > bearish_score
     ):
 
-        signal = "⬆️ BET UP"
+        signal = "â¬†ï¸ BET UP"
 
         direction = "UP"
 
@@ -696,13 +690,13 @@ def analyze_btc():
         and bearish_score > bullish_score
     ):
 
-        signal = "⬇️ BET DOWN"
+        signal = "â¬‡ï¸ BET DOWN"
 
         direction = "DOWN"
 
     else:
 
-        signal = "⏸️ NO TRADE"
+        signal = "â¸ï¸ NO TRADE"
 
         direction = "NONE"
 
@@ -846,15 +840,15 @@ def build_embed(result):
 
     if direction == "UP":
 
-        title = "🟢 BTC UP SIGNAL"
+        title = "ðŸŸ¢ BTC UP SIGNAL"
 
     elif direction == "DOWN":
 
-        title = "🔴 BTC DOWN SIGNAL"
+        title = "ðŸ”´ BTC DOWN SIGNAL"
 
     else:
 
-        title = "⚪ BTC NO TRADE"
+        title = "âšª BTC NO TRADE"
 
     reasons_text = "\n".join(
         result["reasons"]
@@ -882,31 +876,31 @@ def build_embed(result):
         "fields": [
 
             {
-                "name": "₿ BTC PRICE",
+                "name": "â‚¿ BTC PRICE",
                 "value": f"**${price:,.2f}**",
                 "inline": False
             },
 
             {
-                "name": "📊 SIGNAL",
+                "name": "ðŸ“Š SIGNAL",
                 "value": f"**{signal}**",
                 "inline": True
             },
 
             {
-                "name": "🎯 CONFIDENCE",
+                "name": "ðŸŽ¯ CONFIDENCE",
                 "value": f"**{confidence}%**",
                 "inline": True
             },
 
             {
-                "name": "🕯 HOLD",
+                "name": "ðŸ•¯ HOLD",
                 "value": f"**{result['hold_candles']} candle(s)**",
                 "inline": True
             },
 
             {
-                "name": "📈 SCORE",
+                "name": "ðŸ“ˆ SCORE",
                 "value": (
                     f"Bullish: **{result['bullish_score']}**\n"
                     f"Bearish: **{result['bearish_score']}**\n"
@@ -916,7 +910,7 @@ def build_embed(result):
             },
 
             {
-                "name": "📐 INDICATORS",
+                "name": "ðŸ“ INDICATORS",
                 "value": (
                     f"RSI: **{result['rsi']:.1f}**\n"
                     f"MACD: **{result['macd']:.2f}**\n"
@@ -929,7 +923,7 @@ def build_embed(result):
             },
 
             {
-                "name": "📍 TRADE LEVELS",
+                "name": "ðŸ“ TRADE LEVELS",
                 "value": (
                     f"Entry: **${result['entry']:,.2f}**\n"
                     f"Take Profit: **${result['take_profit']:,.2f}**\n"
@@ -939,13 +933,13 @@ def build_embed(result):
             },
 
             {
-                "name": "🔬 ANALYSIS",
+                "name": "ðŸ”¬ ANALYSIS",
                 "value": reasons_text,
                 "inline": False
             },
 
             {
-                "name": "📊 RANGE",
+                "name": "ðŸ“Š RANGE",
                 "value": (
                     f"Previous High: **${result['previous_high']:,.2f}**\n"
                     f"Previous Low: **${result['previous_low']:,.2f}**\n"
@@ -957,8 +951,8 @@ def build_embed(result):
 
         "footer": {
             "text": (
-                "PKLA Signal Hub • "
-                "BTC • RSI • MACD • EMA • Volume"
+                "PKLA Signal Hub â€¢ "
+                "BTC â€¢ RSI â€¢ MACD â€¢ EMA â€¢ Volume"
             )
         },
 
