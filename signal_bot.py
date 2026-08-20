@@ -219,7 +219,7 @@ def send_discord(embed):
         return False
 
     payload = {
-        "username": "PKLA BTC Radar",
+        "username": "Cash Gang BTC Radar",
         "embeds": [
             embed
         ]
