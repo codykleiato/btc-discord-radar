@@ -3,6 +3,7 @@ import json
 import time
 import urllib.request
 import urllib.error
+import threading
 from flask import Flask
 from datetime import datetime, timezone
 
@@ -93,9 +94,14 @@ def test_discord():
 
 
 def start_web_server():
-    # Kept for local `python signal_bot.py` use.
-    # Render should use Gunicorn instead.
-    port = int(os.environ.get("PORT", "10000"))
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
+
     app.run(
         host="0.0.0.0",
         port=port
