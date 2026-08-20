@@ -52,6 +52,47 @@ def home():
     }
 
 
+# ============================================================
+# DISCORD TEST ENDPOINT
+# ============================================================
+
+@app.route("/test")
+def test_discord():
+
+    embed = {
+        "title": "🧪 PKLA BTC Radar Test",
+
+        "description": (
+            "Discord connection successful!\n\n"
+            "Render → PKLA Bot → Discord is working."
+        ),
+
+        "color": 5763719,
+
+        "footer": {
+            "text": "PKLA Signal Hub • Connection Test"
+        },
+
+        "timestamp": datetime.now(
+            timezone.utc
+        ).isoformat()
+    }
+
+    success = send_discord(embed)
+
+    if success:
+
+        return {
+            "status": "success",
+            "message": "Test message sent to Discord"
+        }
+
+    return {
+        "status": "error",
+        "message": "Discord test failed"
+    }, 500
+
+
 def start_web_server():
 
     port = int(
