@@ -3,6 +3,8 @@ import json
 import time
 import urllib.request
 import urllib.error
+import threading
+from flask import Flask
 from datetime import datetime, timezone
 
 
@@ -24,21 +26,45 @@ from datetime import datetime, timezone
 
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
 
-# Optional:
-# Set to 1 to send NO TRADE signals too.
 SEND_NO_TRADE = os.environ.get("SEND_NO_TRADE", "0") == "1"
 
-# How often the bot checks Binance.
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "10"))
 
-# BTC symbol
 SYMBOL = "BTCUSDT"
 
-# Binance 15-minute candles
 INTERVAL = "15m"
 
-# Number of candles downloaded
 CANDLE_LIMIT = 200
+
+
+# ============================================================
+# RENDER WEB SERVER
+# ============================================================
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def home():
+    return {
+        "status": "online",
+        "service": "btc-discord-radar"
+    }
+
+
+def start_web_server():
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
 
 
 # ============================================================
@@ -297,12 +323,6 @@ def analyze_btc():
 
     candles = get_btc_candles()
 
-    # --------------------------------------------------------
-    # Remove currently forming candle.
-    #
-    # This means the signal is based on CLOSED 15M candles.
-    # --------------------------------------------------------
-
     closed = candles[:-1]
 
     if len(closed) < 50:
@@ -341,10 +361,6 @@ def analyze_btc():
         for candle in closed
     ]
 
-    # ========================================================
-    # CURRENT VALUES
-    # ========================================================
-
     price = closes[-1]
 
     previous_price = closes[-2]
@@ -356,10 +372,6 @@ def analyze_btc():
     current_low = lows[-1]
 
     current_volume = volumes[-1]
-
-    # ========================================================
-    # INDICATORS
-    # ========================================================
 
     ema9_values = ema(
         closes,
@@ -391,10 +403,6 @@ def analyze_btc():
         closes
     )
 
-    # ========================================================
-    # VOLUME
-    # ========================================================
-
     volume_window = volumes[-21:-1]
 
     average_volume = (
@@ -410,10 +418,6 @@ def analyze_btc():
         if average_volume > 0
         else 1.0
     )
-
-    # ========================================================
-    # CANDLE
-    # ========================================================
 
     candle_range = max(
         current_high - current_low,
@@ -433,10 +437,6 @@ def analyze_btc():
 
     bearish_candle = price < current_open
 
-    # ========================================================
-    # MOMENTUM
-    # ========================================================
-
     recent_change = (
         price - closes[-4]
     )
@@ -444,10 +444,6 @@ def analyze_btc():
     bullish_momentum = recent_change > 0
 
     bearish_momentum = recent_change < 0
-
-    # ========================================================
-    # PREVIOUS RANGE
-    # ========================================================
 
     previous_highs = highs[-21:-1]
 
@@ -469,19 +465,11 @@ def analyze_btc():
         price < previous_low
     )
 
-    # ========================================================
-    # SCORE
-    # ========================================================
-
     bullish_score = 0
 
     bearish_score = 0
 
     reasons = []
-
-    # --------------------------------------------------------
-    # EMA TREND
-    # --------------------------------------------------------
 
     if ema9 > ema21:
 
@@ -499,10 +487,6 @@ def analyze_btc():
             "🔴 EMA9 < EMA21"
         )
 
-    # --------------------------------------------------------
-    # EMA 40 TREND
-    # --------------------------------------------------------
-
     if price > ema40:
 
         bullish_score += 2
@@ -518,10 +502,6 @@ def analyze_btc():
         reasons.append(
             "🔴 BTC below EMA40"
         )
-
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
 
     if current_rsi >= 55:
 
@@ -555,10 +535,6 @@ def analyze_btc():
             f"🔴 RSI slightly bearish ({current_rsi:.1f})"
         )
 
-    # --------------------------------------------------------
-    # MACD
-    # --------------------------------------------------------
-
     if macd_value > macd_signal:
 
         bullish_score += 2
@@ -574,10 +550,6 @@ def analyze_btc():
         reasons.append(
             "🔴 MACD bearish"
         )
-
-    # --------------------------------------------------------
-    # VOLUME
-    # --------------------------------------------------------
 
     if relative_volume >= 1.15:
 
@@ -609,10 +581,6 @@ def analyze_btc():
             f"⚪ Normal volume ({relative_volume:.2f}x)"
         )
 
-    # --------------------------------------------------------
-    # CANDLE QUALITY
-    # --------------------------------------------------------
-
     if candle_range > 0:
 
         if bullish_candle and close_position >= 0.70:
@@ -631,10 +599,6 @@ def analyze_btc():
                 "🔴 Strong bearish candle close"
             )
 
-    # --------------------------------------------------------
-    # MOMENTUM
-    # --------------------------------------------------------
-
     if bullish_momentum:
 
         bullish_score += 1
@@ -650,10 +614,6 @@ def analyze_btc():
         reasons.append(
             "🔴 Short-term momentum DOWN"
         )
-
-    # --------------------------------------------------------
-    # BREAKOUT
-    # --------------------------------------------------------
 
     if breakout_up:
 
@@ -671,12 +631,6 @@ def analyze_btc():
             "📉 Downside range breakout"
         )
 
-    # ========================================================
-    # TOTAL SCORE
-    # ========================================================
-
-    total_possible = 15
-
     score_gap = abs(
         bullish_score
         - bearish_score
@@ -686,10 +640,6 @@ def analyze_btc():
         bullish_score,
         bearish_score
     )
-
-    # ========================================================
-    # SIGNAL
-    # ========================================================
 
     if (
         bullish_score >= 8
@@ -715,22 +665,7 @@ def analyze_btc():
 
         direction = "NONE"
 
-    # ========================================================
-    # CONFIDENCE
-    # ========================================================
-
-    if direction == "UP":
-
-        confidence = (
-            50
-            + (score_gap * 5)
-            + max(
-                0,
-                strongest_score - 8
-            ) * 3
-        )
-
-    elif direction == "DOWN":
+    if direction in ("UP", "DOWN"):
 
         confidence = (
             50
@@ -755,27 +690,13 @@ def analyze_btc():
         )
     )
 
-    # ========================================================
-    # HOLD ESTIMATE
-    # ========================================================
-
     if confidence >= 80:
 
         hold_candles = 2
 
-    elif confidence >= 65:
-
-        hold_candles = 1
-
     else:
 
         hold_candles = 1
-
-    # ========================================================
-    # TARGET / STOP ESTIMATES
-    #
-    # These are analytical reference levels, NOT guarantees.
-    # ========================================================
 
     recent_ranges = [
         highs[i] - lows[i]
@@ -832,13 +753,7 @@ def analyze_btc():
 
         stop_loss = price
 
-    # ========================================================
-    # TIME
-    # ========================================================
-
-    candle_timestamp = (
-        candle_times[-1]
-    )
+    candle_timestamp = candle_times[-1]
 
     candle_datetime = datetime.fromtimestamp(
         candle_timestamp / 1000,
@@ -927,33 +842,25 @@ def build_embed(result):
 
             {
                 "name": "₿ BTC PRICE",
-                "value": (
-                    f"**${price:,.2f}**"
-                ),
+                "value": f"**${price:,.2f}**",
                 "inline": False
             },
 
             {
                 "name": "📊 SIGNAL",
-                "value": (
-                    f"**{signal}**"
-                ),
+                "value": f"**{signal}**",
                 "inline": True
             },
 
             {
                 "name": "🎯 CONFIDENCE",
-                "value": (
-                    f"**{confidence}%**"
-                ),
+                "value": f"**{confidence}%**",
                 "inline": True
             },
 
             {
                 "name": "🕯 HOLD",
-                "value": (
-                    f"**{result['hold_candles']} candle(s)**"
-                ),
+                "value": f"**{result['hold_candles']} candle(s)**",
                 "inline": True
             },
 
@@ -1128,16 +1035,11 @@ def run_radar():
 
                 continue
 
-            # The second-to-last candle is the latest CLOSED candle.
             latest_closed = candles[-2]
 
             candle_timestamp = int(
                 latest_closed[0]
             )
-
-            # ------------------------------------------------
-            # Only process each closed candle once.
-            # ------------------------------------------------
 
             if (
                 last_processed_candle
@@ -1185,17 +1087,9 @@ def run_radar():
                 result["bearish_score"]
             )
 
-            # ------------------------------------------------
-            # Send Discord
-            # ------------------------------------------------
-
             send_signal(
                 result
             )
-
-            # ------------------------------------------------
-            # Mark candle as processed AFTER analysis.
-            # ------------------------------------------------
 
             last_processed_candle = (
                 candle_timestamp
@@ -1233,4 +1127,11 @@ def run_radar():
 
 if __name__ == "__main__":
 
+    # Start Flask so Render detects an open port.
+    threading.Thread(
+        target=start_web_server,
+        daemon=True
+    ).start()
+
+    # Start the BTC radar.
     run_radar()
