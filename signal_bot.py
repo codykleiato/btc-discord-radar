@@ -12,9 +12,10 @@ from datetime import datetime, timezone
 # PKLA BTC DISCORD RADAR
 # ============================================================
 #
-# BTC DATA  -> BINANCE
-# ANALYSIS  -> EMA + RSI + MACD + VOLUME + BREAKOUT
-# OUTPUT    -> DISCORD WEBHOOK
+# BTC DATA  -> COINBASE EXCHANGE
+# TIMEFRAME  -> 15 MINUTES
+# ANALYSIS   -> EMA + RSI + MACD + VOLUME + BREAKOUT
+# OUTPUT     -> DISCORD WEBHOOK
 #
 # TRADINGVIEW WEBHOOK NOT REQUIRED
 # ============================================================
@@ -43,9 +44,9 @@ CHECK_INTERVAL = int(
     )
 )
 
-SYMBOL = "BTCUSDT"
+SYMBOL = "BTC-USD"
 
-INTERVAL = "15m"
+GRANULARITY = 900
 
 CANDLE_LIMIT = 200
 
@@ -133,14 +134,13 @@ def start_web_server():
 
 
 # ============================================================
-# BINANCE URL
+# COINBASE EXCHANGE API
 # ============================================================
 
-BINANCE_URL = (
-    "https://api.binance.com/api/v3/klines"
-    f"?symbol={SYMBOL}"
-    f"&interval={INTERVAL}"
-    f"&limit={CANDLE_LIMIT}"
+COINBASE_URL = (
+    "https://api.exchange.coinbase.com/products/"
+    f"{SYMBOL}/candles"
+    f"?granularity={GRANULARITY}"
 )
 
 
@@ -153,7 +153,8 @@ def get_json(url):
     request = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "PKLA-BTC-Radar/2.0"
+            "User-Agent": "PKLA-BTC-Radar/3.0",
+            "Accept": "application/json"
         }
     )
 
@@ -165,6 +166,54 @@ def get_json(url):
         return json.loads(
             response.read().decode("utf-8")
         )
+
+
+# ============================================================
+# GET BTC CANDLES FROM COINBASE
+# ============================================================
+
+def get_btc_candles():
+
+    print(
+        "Requesting BTC candles from Coinbase...",
+        flush=True
+    )
+
+    candles = get_json(
+        COINBASE_URL
+    )
+
+    if not candles:
+
+        raise RuntimeError(
+            "Coinbase returned no candles."
+        )
+
+    # Coinbase candle format:
+    #
+    # [
+    #   time,
+    #   low,
+    #   high,
+    #   open,
+    #   close,
+    #   volume
+    # ]
+    #
+    # Coinbase normally returns newest first.
+    # Reverse it so candles are oldest -> newest.
+
+    candles = sorted(
+        candles,
+        key=lambda candle: int(candle[0])
+    )
+
+    print(
+        f"Coinbase returned {len(candles)} candles.",
+        flush=True
+    )
+
+    return candles
 
 
 # ============================================================
@@ -349,11 +398,11 @@ def send_discord(
             flush=True
         )
 
-        if return_error:
-
-            return False, error
-
-        return False
+        return (
+            (False, error)
+            if return_error
+            else False
+        )
 
     payload = {
         "username": "Cash Gang BTC Radar",
@@ -369,7 +418,7 @@ def send_discord(
         data=data,
         headers={
             "Content-Type": "application/json",
-            "User-Agent": "PKLA-BTC-Radar/2.0"
+            "User-Agent": "PKLA-BTC-Radar/3.0"
         },
         method="POST"
     )
@@ -474,41 +523,23 @@ def send_discord(
 
 
 # ============================================================
-# GET BTC CANDLES
-# ============================================================
-
-def get_btc_candles():
-
-    print(
-        "Requesting BTC candles from Binance...",
-        flush=True
-    )
-
-    candles = get_json(
-        BINANCE_URL
-    )
-
-    if not candles:
-
-        raise RuntimeError(
-            "Binance returned no candles."
-        )
-
-    print(
-        f"Binance returned {len(candles)} candles.",
-        flush=True
-    )
-
-    return candles
-
-
-# ============================================================
 # ANALYZE BTC
 # ============================================================
 
 def analyze_btc():
 
     candles = get_btc_candles()
+
+    if len(candles) < 60:
+
+        raise RuntimeError(
+            "Not enough Coinbase candles."
+        )
+
+    # Remove the currently forming candle.
+    #
+    # Coinbase returns the most recent candle,
+    # which may still be forming.
 
     closed = candles[:-1]
 
@@ -519,7 +550,7 @@ def analyze_btc():
         )
 
     opens = [
-        float(candle[1])
+        float(candle[3])
         for candle in closed
     ]
 
@@ -529,7 +560,7 @@ def analyze_btc():
     ]
 
     lows = [
-        float(candle[3])
+        float(candle[1])
         for candle in closed
     ]
 
@@ -549,8 +580,6 @@ def analyze_btc():
     ]
 
     price = closes[-1]
-
-    previous_price = closes[-2]
 
     current_open = opens[-1]
 
@@ -611,10 +640,6 @@ def analyze_btc():
         0.01
     )
 
-    candle_body = abs(
-        price - current_open
-    )
-
     close_position = (
         (price - current_low)
         / candle_range
@@ -666,6 +691,7 @@ def analyze_btc():
 
     reasons = []
 
+    # EMA TREND
     if ema9 > ema21:
 
         bullish_score += 2
@@ -682,6 +708,7 @@ def analyze_btc():
             "🔴 EMA9 < EMA21"
         )
 
+    # EMA40
     if price > ema40:
 
         bullish_score += 2
@@ -698,6 +725,7 @@ def analyze_btc():
             "🔴 BTC below EMA40"
         )
 
+    # RSI
     if current_rsi >= 55:
 
         bullish_score += 2
@@ -730,6 +758,7 @@ def analyze_btc():
             f"🔴 RSI slightly bearish ({current_rsi:.1f})"
         )
 
+    # MACD
     if macd_value > macd_signal:
 
         bullish_score += 2
@@ -746,6 +775,7 @@ def analyze_btc():
             "🔴 MACD bearish"
         )
 
+    # VOLUME
     if relative_volume >= 1.15:
 
         if bullish_candle:
@@ -776,6 +806,7 @@ def analyze_btc():
             f"⚪ Normal volume ({relative_volume:.2f}x)"
         )
 
+    # CANDLE CLOSE
     if candle_range > 0:
 
         if (
@@ -800,6 +831,7 @@ def analyze_btc():
                 "🔴 Strong bearish candle close"
             )
 
+    # MOMENTUM
     if bullish_momentum:
 
         bullish_score += 1
@@ -816,6 +848,7 @@ def analyze_btc():
             "🔴 Short-term momentum DOWN"
         )
 
+    # BREAKOUT
     if breakout_up:
 
         bullish_score += 3
@@ -842,6 +875,7 @@ def analyze_btc():
         bearish_score
     )
 
+    # SIGNAL
     if (
         bullish_score >= 8
         and bullish_score > bearish_score
@@ -866,6 +900,7 @@ def analyze_btc():
 
         direction = "NONE"
 
+    # CONFIDENCE
     if direction in (
         "UP",
         "DOWN"
@@ -873,7 +908,7 @@ def analyze_btc():
 
         confidence = (
             50
-            + (score_gap * 5)
+            + score_gap * 5
             + max(
                 0,
                 strongest_score - 8
@@ -894,6 +929,7 @@ def analyze_btc():
         )
     )
 
+    # HOLD
     if confidence >= 80:
 
         hold_candles = 2
@@ -902,6 +938,7 @@ def analyze_btc():
 
         hold_candles = 1
 
+    # RANGE
     recent_ranges = [
 
         highs[i] - lows[i]
@@ -926,6 +963,7 @@ def analyze_btc():
 
         average_range = candle_range
 
+    # TRADE LEVELS
     if direction == "UP":
 
         entry = price
@@ -965,7 +1003,7 @@ def analyze_btc():
     candle_timestamp = candle_times[-1]
 
     candle_datetime = datetime.fromtimestamp(
-        candle_timestamp / 1000,
+        candle_timestamp,
         tz=timezone.utc
     )
 
@@ -1029,13 +1067,13 @@ def analyze_btc():
 
 def build_embed(result):
 
-    signal = result["signal"]
-
     direction = result["direction"]
+
+    price = result["price"]
 
     confidence = result["confidence"]
 
-    price = result["price"]
+    signal = result["signal"]
 
     if direction == "UP":
 
@@ -1233,7 +1271,12 @@ def run_radar():
     )
 
     print(
-        "Data: Binance",
+        "Data: Coinbase Exchange",
+        flush=True
+    )
+
+    print(
+        "Market: BTC-USD",
         flush=True
     )
 
@@ -1273,19 +1316,7 @@ def run_radar():
     else:
 
         print(
-            "WARNING:",
-            flush=True
-        )
-
-        print(
-            "DISCORD_WEBHOOK environment variable "
-            "has not been configured.",
-            flush=True
-        )
-
-        print(
-            "The bot will analyze BTC but "
-            "cannot send Discord messages.",
+            "WARNING: DISCORD_WEBHOOK is not configured.",
             flush=True
         )
 
@@ -1301,7 +1332,7 @@ def run_radar():
         try:
 
             print(
-                "Checking Binance for new closed candle...",
+                "Checking Coinbase for new closed candle...",
                 flush=True
             )
 
@@ -1310,7 +1341,7 @@ def run_radar():
             if len(candles) < 3:
 
                 print(
-                    "Not enough Binance data.",
+                    "Not enough Coinbase data.",
                     flush=True
                 )
 
@@ -1320,6 +1351,9 @@ def run_radar():
 
                 continue
 
+            # Most recent candle may still be forming.
+            # Second-to-last candle is the latest closed candle.
+
             latest_closed = candles[-2]
 
             candle_timestamp = int(
@@ -1327,7 +1361,7 @@ def run_radar():
             )
 
             candle_datetime = datetime.fromtimestamp(
-                candle_timestamp / 1000,
+                candle_timestamp,
                 tz=timezone.utc
             )
 
@@ -1459,11 +1493,9 @@ if __name__ == "__main__":
         flush=True
     )
 
-    # Start Flask so Render detects an open port.
     threading.Thread(
         target=start_web_server,
         daemon=True
     ).start()
 
-    # Start the BTC radar.
     run_radar()
