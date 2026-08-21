@@ -17,7 +17,7 @@ last_price = None
 last_checked_at = None
 
 
-@app.get("/")
+@app.route("/")
 def home():
     return jsonify(
         {
@@ -30,7 +30,7 @@ def home():
     )
 
 
-@app.get("/health")
+@app.route("/health")
 def health():
     return jsonify({"status": "ok"}), 200
 
@@ -38,7 +38,10 @@ def health():
 def get_btc_price():
     response = requests.get(
         "https://api.coingecko.com/api/v3/simple/price",
-        params={"ids": "bitcoin", "vs_currencies": "usd"},
+        params={
+            "ids": "bitcoin",
+            "vs_currencies": "usd",
+        },
         timeout=15,
     )
     response.raise_for_status()
@@ -49,8 +52,8 @@ def get_btc_price():
 
 def send_discord_message(message):
     if not DISCORD_WEBHOOK_URL:
-        print("DISCORD_WEBHOOK_URL is not set. Alert was not sent.")
-        return False
+        print("DISCORD_WEBHOOK_URL is missing; Discord message was not sent.")
+        return
 
     response = requests.post(
         DISCORD_WEBHOOK_URL,
@@ -58,55 +61,51 @@ def send_discord_message(message):
         timeout=15,
     )
     response.raise_for_status()
-    return True
 
 
 def check_btc_price():
-    global last_alert_state
-    global last_price
-    global last_checked_at
+    global last_alert_state, last_price, last_checked_at
 
     try:
         price = get_btc_price()
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         last_price = price
-        last_checked_at = now
+        last_checked_at = checked_at
 
-        is_above_threshold = price >= BTC_ALERT_ABOVE
+        above_threshold = price >= BTC_ALERT_ABOVE
 
         print(
-            f"[{now}] BTC price: ${price:,.2f} | "
-            f"Threshold: ${BTC_ALERT_ABOVE:,.2f}"
+            f"[{checked_at}] BTC: ${price:,.2f}; "
+            f"alert level: ${BTC_ALERT_ABOVE:,.2f}"
         )
 
-        if is_above_threshold and last_alert_state is not True:
+        if above_threshold and last_alert_state is not True:
             send_discord_message(
                 f"🚨 **BTC Price Alert**\n"
-                f"Bitcoin is now **${price:,.2f} USD**.\n"
-                f"It crossed above your alert level of "
-                f"**${BTC_ALERT_ABOVE:,.2f} USD**."
+                f"Bitcoin: **${price:,.2f} USD**\n"
+                f"Above target: **${BTC_ALERT_ABOVE:,.2f} USD**"
             )
-            print("Discord above-threshold alert sent.")
+            print("Above-threshold Discord alert sent.")
 
-        elif not is_above_threshold and last_alert_state is True:
+        if not above_threshold and last_alert_state is True:
             send_discord_message(
                 f"📉 **BTC Price Update**\n"
-                f"Bitcoin is now **${price:,.2f} USD**.\n"
-                f"It moved back below **${BTC_ALERT_ABOVE:,.2f} USD**."
+                f"Bitcoin: **${price:,.2f} USD**\n"
+                f"Below target: **${BTC_ALERT_ABOVE:,.2f} USD**"
             )
-            print("Discord below-threshold update sent.")
+            print("Below-threshold Discord update sent.")
 
-        last_alert_state = is_above_threshold
+        last_alert_state = above_threshold
 
     except requests.RequestException as error:
-        print(f"Network/API/Discord error: {error}")
+        print(f"BTC or Discord request failed: {error}")
 
     except (KeyError, TypeError, ValueError) as error:
-        print(f"Unexpected price data error: {error}")
+        print(f"Invalid BTC price response: {error}")
 
     except Exception as error:
-        print(f"Unexpected error: {error}")
+        print(f"Unexpected monitor error: {error}")
 
 
 def price_monitor():
@@ -116,8 +115,7 @@ def price_monitor():
 
 
 if __name__ == "__main__":
-    monitor_thread = threading.Thread(target=price_monitor, daemon=True)
-    monitor_thread.start()
+    threading.Thread(target=price_monitor, daemon=True).start()
 
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
