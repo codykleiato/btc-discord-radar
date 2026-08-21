@@ -4,42 +4,51 @@ import time
 import urllib.request
 import urllib.error
 import threading
-from datetime import datetime, timezone
 from flask import Flask
+from datetime import datetime, timezone
+
 
 # ============================================================
 # PKLA BTC DISCORD RADAR
-# Coinbase BTC-USD / 15M
-# Discord delivery uses a BOT REST API, NOT a webhook.
+# FREE AUTOMATED VERSION
+#
+# BTC DATA  -> BINANCE
+# ANALYSIS  -> EMA + RSI + MACD + VOLUME + BREAKOUT
+# OUTPUT    -> DISCORD WEBHOOK
+#
+# NO TRADINGVIEW PAID WEBHOOK REQUIRED
 # ============================================================
 
-DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
-DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "").strip()
 
-SEND_NO_TRADE = os.environ.get("SEND_NO_TRADE", "0") == "1"
+# ============================================================
+# ENVIRONMENT VARIABLES
+# ============================================================
+
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
+
+SEND_NO_TRADE = os.environ.get("SEND_NO_TRADE", "1") == "1"
+
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "10"))
 
-SYMBOL = "BTC-USD"
-GRANULARITY = 900
+SYMBOL = "BTCUSDT"
 
-COINBASE_URL = (
-    "https://api.exchange.coinbase.com/products/"
-    f"{SYMBOL}/candles?granularity={GRANULARITY}"
-)
+INTERVAL = "15m"
+
+CANDLE_LIMIT = 200
+
+
+# ============================================================
+# RENDER WEB SERVER
+# ============================================================
 
 app = Flask(__name__)
 
-
-# ============================================================
-# HOME
-# ============================================================
 
 @app.route("/")
 def home():
     return {
         "status": "online",
-        "service": "btc-discord-radar",
-        "discord": "bot_api"
+        "service": "btc-discord-radar"
     }
 
 
@@ -69,12 +78,10 @@ def test_discord():
         ).isoformat()
     }
 
-    success, error_detail = send_discord(
-        embed,
-        return_error=True
-    )
+    success = send_discord(embed)
 
     if success:
+
         return {
             "status": "success",
             "message": "Test message sent to Discord"
@@ -82,33 +89,35 @@ def test_discord():
 
     return {
         "status": "error",
-        "message": "Discord test failed",
-        "error": error_detail
+        "message": "Discord test failed"
     }, 500
 
-
-# ============================================================
-# WEB SERVER
-# ============================================================
 
 def start_web_server():
 
     port = int(
         os.environ.get(
             "PORT",
-            "10000"
+            10000
         )
-    )
-
-    print(
-        f"Starting web server on port {port}...",
-        flush=True
     )
 
     app.run(
         host="0.0.0.0",
         port=port
     )
+
+
+# ============================================================
+# BINANCE URL
+# ============================================================
+
+BINANCE_URL = (
+    "https://api.binance.com/api/v3/klines"
+    f"?symbol={SYMBOL}"
+    f"&interval={INTERVAL}"
+    f"&limit={CANDLE_LIMIT}"
+)
 
 
 # ============================================================
@@ -120,8 +129,7 @@ def get_json(url):
     request = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "PKLA-BTC-Radar/4.0",
-            "Accept": "application/json"
+            "User-Agent": "PKLA-BTC-Radar/2.0"
         }
     )
 
@@ -136,40 +144,7 @@ def get_json(url):
 
 
 # ============================================================
-# GET BTC CANDLES
-# ============================================================
-
-def get_btc_candles():
-
-    print(
-        "Requesting BTC candles from Coinbase...",
-        flush=True
-    )
-
-    candles = get_json(
-        COINBASE_URL
-    )
-
-    if not candles:
-        raise RuntimeError(
-            "Coinbase returned no candles."
-        )
-
-    candles = sorted(
-        candles,
-        key=lambda candle: int(candle[0])
-    )
-
-    print(
-        f"Coinbase returned {len(candles)} candles.",
-        flush=True
-    )
-
-    return candles
-
-
-# ============================================================
-# INDICATORS
+# EMA
 # ============================================================
 
 def ema(values, period):
@@ -186,14 +161,20 @@ def ema(values, period):
 
     for price in values[1:]:
 
-        result.append(
+        value = (
             (price - result[-1])
             * multiplier
             + result[-1]
         )
 
+        result.append(value)
+
     return result
 
+
+# ============================================================
+# RSI
+# ============================================================
 
 def rsi(values, period=14):
 
@@ -203,15 +184,9 @@ def rsi(values, period=14):
     gains = []
     losses = []
 
-    for i in range(
-        1,
-        len(values)
-    ):
+    for i in range(1, len(values)):
 
-        change = (
-            values[i]
-            - values[i - 1]
-        )
+        change = values[i] - values[i - 1]
 
         gains.append(
             max(change, 0.0)
@@ -221,58 +196,46 @@ def rsi(values, period=14):
             max(-change, 0.0)
         )
 
-    avg_gain = (
-        sum(gains[:period])
-        / period
-    )
+    avg_gain = sum(
+        gains[:period]
+    ) / period
 
-    avg_loss = (
-        sum(losses[:period])
-        / period
-    )
+    avg_loss = sum(
+        losses[:period]
+    ) / period
 
-    for i in range(
-        period,
-        len(gains)
-    ):
+    for i in range(period, len(gains)):
 
         avg_gain = (
-            (
-                avg_gain
-                * (period - 1)
-            )
+            (avg_gain * (period - 1))
             + gains[i]
         ) / period
 
         avg_loss = (
-            (
-                avg_loss
-                * (period - 1)
-            )
+            (avg_loss * (period - 1))
             + losses[i]
         ) / period
 
     if avg_loss == 0:
 
-        return (
-            100.0
-            if avg_gain
-            else 50.0
-        )
+        if avg_gain == 0:
+            return 50.0
 
-    rs = (
-        avg_gain
-        / avg_loss
+        return 100.0
+
+    relative_strength = (
+        avg_gain / avg_loss
     )
 
-    return (
+    return 100.0 - (
         100.0
-        - (
-            100.0
-            / (1.0 + rs)
-        )
+        / (1.0 + relative_strength)
     )
 
+
+# ============================================================
+# MACD
+# ============================================================
 
 def macd(values):
 
@@ -288,8 +251,7 @@ def macd(values):
 
     macd_line = [
         a - b
-        for a, b
-        in zip(
+        for a, b in zip(
             ema12,
             ema26
         )
@@ -310,60 +272,24 @@ def macd(values):
 
 
 # ============================================================
-# DISCORD BOT REST API
+# DISCORD
 # ============================================================
 
-def send_discord(
-    embed,
-    return_error=False
-):
+def send_discord(embed):
 
-    if not DISCORD_BOT_TOKEN:
-
-        error = (
-            "DISCORD_BOT_TOKEN "
-            "is missing or empty."
-        )
+    if not DISCORD_WEBHOOK:
 
         print(
-            "Discord error:",
-            error,
-            flush=True
+            "ERROR: DISCORD_WEBHOOK is missing."
         )
 
-        return (
-            (False, error)
-            if return_error
-            else False
-        )
-
-    if not DISCORD_CHANNEL_ID:
-
-        error = (
-            "DISCORD_CHANNEL_ID "
-            "is missing or empty."
-        )
-
-        print(
-            "Discord error:",
-            error,
-            flush=True
-        )
-
-        return (
-            (False, error)
-            if return_error
-            else False
-        )
-
-    url = (
-        "https://discord.com/api/v10/channels/"
-        f"{DISCORD_CHANNEL_ID}/messages"
-    )
+        return False
 
     payload = {
         "username": "Cash Gang BTC Radar",
-        "embeds": [embed]
+        "embeds": [
+            embed
+        ]
     }
 
     data = json.dumps(
@@ -371,18 +297,19 @@ def send_discord(
     ).encode("utf-8")
 
     request = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "Authorization":
-                f"Bot {DISCORD_BOT_TOKEN}",
 
+        DISCORD_WEBHOOK,
+
+        data=data,
+
+        headers={
             "Content-Type":
                 "application/json",
 
             "User-Agent":
-                "PKLA-BTC-Radar/4.0"
+                "PKLA-BTC-Radar/2.0"
         },
+
         method="POST"
     )
 
@@ -393,115 +320,50 @@ def send_discord(
             timeout=15
         ) as response:
 
-            status = response.status
-
             print(
-                "Discord Bot API response:",
-                status,
-                flush=True
+                "Discord response:",
+                response.status
             )
 
-            if 200 <= status < 300:
-
-                return (
-                    (True, None)
-                    if return_error
-                    else True
-                )
-
-            error = (
-                "Discord Bot API returned "
-                f"HTTP {status}"
-            )
-
-            print(
-                "Discord error:",
-                error,
-                flush=True
-            )
-
-            return (
-                (False, error)
-                if return_error
-                else False
-            )
-
-    except urllib.error.HTTPError as error:
-
-        body = error.read().decode(
-            "utf-8",
-            errors="replace"
-        )
-
-        detail = (
-            f"HTTP {error.code}: {body}"
-        )
-
-        print(
-            "Discord error:",
-            detail,
-            flush=True
-        )
-
-        return (
-            (False, detail)
-            if return_error
-            else False
-        )
-
-    except urllib.error.URLError as error:
-
-        detail = (
-            f"URL error: {error.reason}"
-        )
-
-        print(
-            "Discord error:",
-            detail,
-            flush=True
-        )
-
-        return (
-            (False, detail)
-            if return_error
-            else False
-        )
+            return True
 
     except Exception as error:
 
-        detail = (
-            f"{type(error).__name__}: "
-            f"{error}"
-        )
-
         print(
             "Discord error:",
-            detail,
-            flush=True
+            error
         )
 
-        return (
-            (False, detail)
-            if return_error
-            else False
-        )
+        return False
 
 
 # ============================================================
-# BTC ANALYSIS
+# GET BTC CANDLES
+# ============================================================
+
+def get_btc_candles():
+
+    candles = get_json(
+        BINANCE_URL
+    )
+
+    if not candles:
+
+        raise RuntimeError(
+            "Binance returned no candles."
+        )
+
+    return candles
+
+
+# ============================================================
+# ANALYZE BTC
 # ============================================================
 
 def analyze_btc():
 
     candles = get_btc_candles()
 
-    if len(candles) < 60:
-
-        raise RuntimeError(
-            "Not enough Coinbase candles."
-        )
-
-    # Latest candle can still be forming.
     closed = candles[:-1]
 
     if len(closed) < 50:
@@ -511,56 +373,67 @@ def analyze_btc():
         )
 
     opens = [
-        float(c[3])
-        for c in closed
+        float(candle[1])
+        for candle in closed
     ]
 
     highs = [
-        float(c[2])
-        for c in closed
+        float(candle[2])
+        for candle in closed
     ]
 
     lows = [
-        float(c[1])
-        for c in closed
+        float(candle[3])
+        for candle in closed
     ]
 
     closes = [
-        float(c[4])
-        for c in closed
+        float(candle[4])
+        for candle in closed
     ]
 
     volumes = [
-        float(c[5])
-        for c in closed
+        float(candle[5])
+        for candle in closed
     ]
 
     candle_times = [
-        int(c[0])
-        for c in closed
+        int(candle[0])
+        for candle in closed
     ]
 
     price = closes[-1]
 
+    previous_price = closes[-2]
+
     current_open = opens[-1]
+
     current_high = highs[-1]
+
     current_low = lows[-1]
+
     current_volume = volumes[-1]
 
-    ema9 = ema(
+    ema9_values = ema(
         closes,
         9
-    )[-1]
+    )
 
-    ema21 = ema(
+    ema21_values = ema(
         closes,
         21
-    )[-1]
+    )
 
-    ema40 = ema(
+    ema40_values = ema(
         closes,
         40
-    )[-1]
+    )
+
+    ema9 = ema9_values[-1]
+
+    ema21 = ema21_values[-1]
+
+    ema40 = ema40_values[-1]
 
     current_rsi = rsi(
         closes,
@@ -592,36 +465,37 @@ def analyze_btc():
         0.01
     )
 
+    candle_body = abs(
+        price - current_open
+    )
+
     close_position = (
-        price - current_low
-    ) / candle_range
-
-    bullish_candle = (
-        price > current_open
+        (price - current_low)
+        / candle_range
     )
 
-    bearish_candle = (
-        price < current_open
-    )
+    bullish_candle = price > current_open
+
+    bearish_candle = price < current_open
 
     recent_change = (
         price - closes[-4]
     )
 
-    bullish_momentum = (
-        recent_change > 0
-    )
+    bullish_momentum = recent_change > 0
 
-    bearish_momentum = (
-        recent_change < 0
-    )
+    bearish_momentum = recent_change < 0
+
+    previous_highs = highs[-21:-1]
+
+    previous_lows = lows[-21:-1]
 
     previous_high = max(
-        highs[-21:-1]
+        previous_highs
     )
 
     previous_low = min(
-        lows[-21:-1]
+        previous_lows
     )
 
     breakout_up = (
@@ -633,6 +507,7 @@ def analyze_btc():
     )
 
     bullish_score = 0
+
     bearish_score = 0
 
     reasons = []
@@ -674,8 +549,7 @@ def analyze_btc():
         bullish_score += 2
 
         reasons.append(
-            f"🟢 RSI bullish "
-            f"({current_rsi:.1f})"
+            f"🟢 RSI bullish ({current_rsi:.1f})"
         )
 
     elif current_rsi <= 45:
@@ -683,8 +557,7 @@ def analyze_btc():
         bearish_score += 2
 
         reasons.append(
-            f"🔴 RSI bearish "
-            f"({current_rsi:.1f})"
+            f"🔴 RSI bearish ({current_rsi:.1f})"
         )
 
     elif current_rsi > 50:
@@ -692,8 +565,7 @@ def analyze_btc():
         bullish_score += 1
 
         reasons.append(
-            f"🟢 RSI slightly bullish "
-            f"({current_rsi:.1f})"
+            f"🟢 RSI slightly bullish ({current_rsi:.1f})"
         )
 
     else:
@@ -701,8 +573,7 @@ def analyze_btc():
         bearish_score += 1
 
         reasons.append(
-            f"🔴 RSI slightly bearish "
-            f"({current_rsi:.1f})"
+            f"🔴 RSI slightly bearish ({current_rsi:.1f})"
         )
 
     if macd_value > macd_signal:
@@ -728,8 +599,7 @@ def analyze_btc():
             bullish_score += 2
 
             reasons.append(
-                f"🟢 Strong bullish volume "
-                f"({relative_volume:.2f}x)"
+                f"🟢 Strong bullish volume ({relative_volume:.2f}x)"
             )
 
         elif bearish_candle:
@@ -737,45 +607,38 @@ def analyze_btc():
             bearish_score += 2
 
             reasons.append(
-                f"🔴 Strong bearish volume "
-                f"({relative_volume:.2f}x)"
+                f"🔴 Strong bearish volume ({relative_volume:.2f}x)"
             )
 
     elif relative_volume < 0.80:
 
         reasons.append(
-            f"⚪ Low volume "
-            f"({relative_volume:.2f}x)"
+            f"⚪ Low volume ({relative_volume:.2f}x)"
         )
 
     else:
 
         reasons.append(
-            f"⚪ Normal volume "
-            f"({relative_volume:.2f}x)"
+            f"⚪ Normal volume ({relative_volume:.2f}x)"
         )
 
-    if (
-        bullish_candle
-        and close_position >= 0.70
-    ):
+    if candle_range > 0:
 
-        bullish_score += 1
+        if bullish_candle and close_position >= 0.70:
 
-        reasons.append(
-            "🟢 Strong bullish candle close"
-        )
+            bullish_score += 1
 
-    elif (
-        bearish_candle
-        and close_position <= 0.30
-    ):
+            reasons.append(
+                "🟢 Strong bullish candle close"
+            )
 
-        bearish_score += 1
+        elif bearish_candle and close_position <= 0.30:
 
-        reasons.append(
-            "🔴 Strong bearish candle close"
-        )
+            bearish_score += 1
+
+            reasons.append(
+                "🔴 Strong bearish candle close"
+            )
 
     if bullish_momentum:
 
@@ -810,7 +673,8 @@ def analyze_btc():
         )
 
     score_gap = abs(
-        bullish_score - bearish_score
+        bullish_score
+        - bearish_score
     )
 
     strongest_score = max(
@@ -824,6 +688,7 @@ def analyze_btc():
     ):
 
         signal = "⬆️ BET UP"
+
         direction = "UP"
 
     elif (
@@ -832,21 +697,20 @@ def analyze_btc():
     ):
 
         signal = "⬇️ BET DOWN"
+
         direction = "DOWN"
 
     else:
 
         signal = "⏸️ NO TRADE"
+
         direction = "NONE"
 
-    if direction in (
-        "UP",
-        "DOWN"
-    ):
+    if direction in ("UP", "DOWN"):
 
         confidence = (
             50
-            + score_gap * 5
+            + (score_gap * 5)
             + max(
                 0,
                 strongest_score - 8
@@ -867,19 +731,18 @@ def analyze_btc():
         )
     )
 
-    hold_candles = (
-        2
-        if confidence >= 80
-        else 1
-    )
+    if confidence >= 80:
+
+        hold_candles = 2
+
+    else:
+
+        hold_candles = 1
 
     recent_ranges = [
         highs[i] - lows[i]
         for i in range(
-            max(
-                0,
-                len(highs) - 14
-            ),
+            max(0, len(highs) - 14),
             len(highs)
         )
     ]
@@ -926,13 +789,15 @@ def analyze_btc():
     else:
 
         entry = price
+
         take_profit = price
+
         stop_loss = price
 
     candle_timestamp = candle_times[-1]
 
     candle_datetime = datetime.fromtimestamp(
-        candle_timestamp,
+        candle_timestamp / 1000,
         tz=timezone.utc
     )
 
@@ -953,6 +818,8 @@ def analyze_btc():
         "relative_volume": relative_volume,
         "previous_high": previous_high,
         "previous_low": previous_low,
+        "breakout_up": breakout_up,
+        "breakout_down": breakout_down,
         "entry": entry,
         "take_profit": take_profit,
         "stop_loss": stop_loss,
@@ -969,28 +836,31 @@ def analyze_btc():
 
 def build_embed(result):
 
+    signal = result["signal"]
+
     direction = result["direction"]
+
+    confidence = result["confidence"]
+
+    price = result["price"]
 
     if direction == "UP":
 
         title = "🟢 BTC UP SIGNAL"
-        color = 5763719
 
     elif direction == "DOWN":
 
         title = "🔴 BTC DOWN SIGNAL"
-        color = 15548997
 
     else:
 
         title = "⚪ BTC NO TRADE"
-        color = 9807270
 
     reasons_text = "\n".join(
         result["reasons"]
     )
 
-    return {
+    embed = {
 
         "title": title,
 
@@ -999,40 +869,40 @@ def build_embed(result):
             "Automated technical analysis"
         ),
 
-        "color": color,
+        "color": (
+            5763719
+            if direction == "UP"
+            else
+            15548997
+            if direction == "DOWN"
+            else
+            9807270
+        ),
 
         "fields": [
 
             {
                 "name": "₿ BTC PRICE",
-                "value": (
-                    f"**${result['price']:,.2f}**"
-                ),
+                "value": f"**${price:,.2f}**",
                 "inline": False
             },
 
             {
                 "name": "📊 SIGNAL",
-                "value": (
-                    f"**{result['signal']}**"
-                ),
-                "inline": False
+                "value": f"**{signal}**",
+                "inline": True
             },
 
             {
                 "name": "🎯 CONFIDENCE",
-                "value": (
-                    f"**{result['confidence']}%**"
-                ),
-                "inline": False
+                "value": f"**{confidence}%**",
+                "inline": True
             },
 
             {
                 "name": "🕯 HOLD",
-                "value": (
-                    f"**{result['hold_candles']} candle(s)**"
-                ),
-                "inline": False
+                "value": f"**{result['hold_candles']} candle(s)**",
+                "inline": True
             },
 
             {
@@ -1042,7 +912,7 @@ def build_embed(result):
                     f"Bearish: **{result['bearish_score']}**\n"
                     f"Gap: **{result['score_gap']}**"
                 ),
-                "inline": False
+                "inline": True
             },
 
             {
@@ -1072,8 +942,17 @@ def build_embed(result):
                 "name": "🔬 ANALYSIS",
                 "value": reasons_text,
                 "inline": False
-            }
+            },
 
+            {
+                "name": "📊 RANGE",
+                "value": (
+                    f"Previous High: **${result['previous_high']:,.2f}**\n"
+                    f"Previous Low: **${result['previous_low']:,.2f}**\n"
+                    f"Relative Volume: **{result['relative_volume']:.2f}x**"
+                ),
+                "inline": False
+            }
         ],
 
         "footer": {
@@ -1088,6 +967,8 @@ def build_embed(result):
         ).isoformat()
     }
 
+    return embed
+
 
 # ============================================================
 # SEND SIGNAL
@@ -1101,33 +982,23 @@ def send_signal(result):
     ):
 
         print(
-            "NO TRADE signal - Discord message skipped.",
-            flush=True
+            "NO TRADE signal - Discord message skipped."
         )
 
         return
 
-    print(
-        "Sending signal to Discord Bot API...",
-        flush=True
+    embed = build_embed(
+        result
     )
 
     success = send_discord(
-        build_embed(result)
+        embed
     )
 
     if success:
 
         print(
-            "Signal successfully sent to Discord.",
-            flush=True
-        )
-
-    else:
-
-        print(
-            "Signal was NOT sent to Discord.",
-            flush=True
+            "Signal successfully sent to Discord."
         )
 
 
@@ -1138,77 +1009,52 @@ def send_signal(result):
 def run_radar():
 
     print(
-        "==========================================",
-        flush=True
+        "=========================================="
     )
 
     print(
-        "       PKLA BTC DISCORD RADAR",
-        flush=True
+        "       PKLA BTC DISCORD RADAR"
     )
 
     print(
-        "==========================================",
-        flush=True
+        "=========================================="
     )
 
     print(
-        "Data: Coinbase Exchange",
-        flush=True
+        "Data: Binance"
     )
 
     print(
-        "Market: BTC-USD",
-        flush=True
+        "Timeframe: 15M"
     )
 
     print(
-        "Timeframe: 15M",
-        flush=True
+        "TradingView webhook: NOT REQUIRED"
     )
 
     print(
-        "TradingView webhook: NOT REQUIRED",
-        flush=True
+        "Discord: ENABLED"
     )
 
     print(
-        "Discord: BOT API",
-        flush=True
+        "=========================================="
     )
 
-    print(
-        f"Check interval: {CHECK_INTERVAL}s",
-        flush=True
-    )
-
-    print(
-        "==========================================",
-        flush=True
-    )
-
-    if (
-        DISCORD_BOT_TOKEN
-        and DISCORD_CHANNEL_ID
-    ):
+    if not DISCORD_WEBHOOK:
 
         print(
-            "Discord bot: CONFIGURED",
-            flush=True
+            "WARNING:"
         )
-
-    else:
 
         print(
-            "WARNING: DISCORD_BOT_TOKEN or "
-            "DISCORD_CHANNEL_ID is not configured.",
-            flush=True
+            "DISCORD_WEBHOOK environment variable "
+            "has not been configured."
         )
 
-    print(
-        "Radar thread started.",
-        flush=True
-    )
+        print(
+            "The bot will analyze BTC but "
+            "cannot send Discord messages."
+        )
 
     last_processed_candle = None
 
@@ -1216,18 +1062,12 @@ def run_radar():
 
         try:
 
-            print(
-                "Checking Coinbase for new closed candle...",
-                flush=True
-            )
-
             candles = get_btc_candles()
 
             if len(candles) < 3:
 
                 print(
-                    "Not enough Coinbase data.",
-                    flush=True
+                    "Not enough Binance data."
                 )
 
                 time.sleep(
@@ -1242,26 +1082,10 @@ def run_radar():
                 latest_closed[0]
             )
 
-            candle_datetime = datetime.fromtimestamp(
-                candle_timestamp,
-                tz=timezone.utc
-            )
-
-            print(
-                "Latest closed candle:",
-                candle_datetime.isoformat(),
-                flush=True
-            )
-
             if (
                 last_processed_candle
                 == candle_timestamp
             ):
-
-                print(
-                    "No new closed 15M candle yet.",
-                    flush=True
-                )
 
                 time.sleep(
                     CHECK_INTERVAL
@@ -1270,51 +1094,38 @@ def run_radar():
                 continue
 
             print(
-                "New closed 15M candle detected!",
-                flush=True
+                "\nNew closed 15M candle detected."
             )
 
             print(
-                "Analyzing BTC...",
-                flush=True
+                "Analyzing BTC..."
             )
 
             result = analyze_btc()
 
             print(
                 "Price:",
-                f"${result['price']:,.2f}",
-                flush=True
+                f"${result['price']:,.2f}"
             )
 
             print(
                 "Signal:",
-                result["signal"],
-                flush=True
+                result["signal"]
             )
 
             print(
                 "Confidence:",
-                f"{result['confidence']}%",
-                flush=True
+                f"{result['confidence']}%"
             )
 
             print(
                 "Bullish score:",
-                result["bullish_score"],
-                flush=True
+                result["bullish_score"]
             )
 
             print(
                 "Bearish score:",
-                result["bearish_score"],
-                flush=True
-            )
-
-            print(
-                "Candle analyzed:",
-                result["candle_datetime"].isoformat(),
-                flush=True
+                result["bearish_score"]
             )
 
             send_signal(
@@ -1325,33 +1136,25 @@ def run_radar():
                 candle_timestamp
             )
 
-            print(
-                "Candle processing complete.",
-                flush=True
-            )
-
         except urllib.error.HTTPError as error:
 
             print(
                 "HTTP error:",
-                error,
-                flush=True
+                error
             )
 
         except urllib.error.URLError as error:
 
             print(
                 "Network error:",
-                error,
-                flush=True
+                error
             )
 
         except Exception as error:
 
             print(
                 "Radar error:",
-                repr(error),
-                flush=True
+                repr(error)
             )
 
         time.sleep(
@@ -1365,14 +1168,11 @@ def run_radar():
 
 if __name__ == "__main__":
 
-    print(
-        "Starting PKLA BTC Discord Radar...",
-        flush=True
-    )
-
+    # Start Flask so Render detects an open port.
     threading.Thread(
         target=start_web_server,
         daemon=True
     ).start()
 
+    # Start the BTC radar.
     run_radar()
