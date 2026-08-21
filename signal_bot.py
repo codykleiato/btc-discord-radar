@@ -1,1066 +1,366 @@
 import os
-import json
 import time
-import urllib.request
-import urllib.error
 import threading
-from flask import Flask
 from datetime import datetime, timezone
 
-
-# ============================================================
-# PKLA BTC DISCORD RADAR
-# FREE AUTOMATED VERSION
-#
-# BTC DATA  -> BINANCE
-# ANALYSIS  -> EMA + RSI + MACD + VOLUME + BREAKOUT
-# OUTPUT    -> DISCORD WEBHOOK
-#
-# NO TRADINGVIEW PAID WEBHOOK REQUIRED
-# ============================================================
-
-
-# ============================================================
-# ENVIRONMENT VARIABLES
-# ============================================================
-
-DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
-
-# ALWAYS SEND EVERY CLOSED CANDLE, INCLUDING NO-TRADE
-SEND_NO_TRADE = True
-
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "10"))
-
-SYMBOL = "BTCUSDT"
-
-INTERVAL = "15m"
-
-CANDLE_LIMIT = 200
-
-
-# ============================================================
-# RENDER WEB SERVER
-# ============================================================
+import requests
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
-@app.route("/")
-def home():
-    return {
-        "status": "online",
-        "service": "btc-discord-radar"
-    }
+SYMBOL = os.getenv("SYMBOL", "BTCUSDT").upper()
+INTERVAL = "15m"
+CANDLE_LIMIT = 120
+RADAR_INTERVAL_SECONDS = 900  # 15 minutes
+SEND_NO_TRADE = os.getenv("SEND_NO_TRADE", "true").lower() == "true"
 
-
-# ============================================================
-# DISCORD TEST ENDPOINT
-# ============================================================
-
-@app.route("/test")
-def test_discord():
-
-    embed = {
-        "title": "🧪 PKLA BTC Radar Test",
-
-        "description": (
-            "Discord connection successful!\n\n"
-            "Render → PKLA Bot → Discord is working."
-        ),
-
-        "color": 5763719,
-
-        "footer": {
-            "text": "PKLA Signal Hub • Connection Test"
-        },
-
-        "timestamp": datetime.now(
-            timezone.utc
-        ).isoformat()
-    }
-
-    success = send_discord(embed)
-
-    if success:
-
-        return {
-            "status": "success",
-            "message": "Test message sent to Discord"
-        }
-
-    return {
-        "status": "error",
-        "message": "Discord test failed"
-    }, 500
+last_radar_candle_time = None
+last_radar_sent_at = None
+last_radar_error = None
 
 
-def start_web_server():
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+def round_price(value):
+    return f"${value:,.2f}"
 
 
-# ============================================================
-# BINANCE URL
-# ============================================================
+def ema(values, length):
+    if len(values) < length:
+        return None
 
-BINANCE_URL = (
-    "https://api.binance.com/api/v3/klines"
-    f"?symbol={SYMBOL}"
-    f"&interval={INTERVAL}"
-    f"&limit={CANDLE_LIMIT}"
-)
+    multiplier = 2 / (length + 1)
+    result = values[0]
 
-
-# ============================================================
-# HTTP JSON
-# ============================================================
-
-def get_json(url):
-
-    last_error = None
-    for attempt in range(1, 4):
-        try:
-            print(f"HTTP request attempt {attempt}/3...", flush=True)
-            request = urllib.request.Request(url, headers={"User-Agent": "PKLA-BTC-Radar/2.0"})
-            with urllib.request.urlopen(request, timeout=10) as response:
-                body = response.read().decode("utf-8")
-                print(f"HTTP response received: {response.status}", flush=True)
-                data = json.loads(body)
-                if not data:
-                    raise RuntimeError("API returned empty data.")
-                return data
-        except Exception as error:
-            last_error = error
-            print(f"HTTP request failed (attempt {attempt}/3): {error}", flush=True)
-            if attempt < 3:
-                time.sleep(2)
-    raise RuntimeError(f"API request failed after 3 attempts: {last_error}")
-
-
-# ============================================================
-# EMA
-# ============================================================
-
-def ema(values, period):
-
-    if not values:
-        return []
-
-    if len(values) < period:
-        return [values[0]] * len(values)
-
-    multiplier = 2.0 / (period + 1.0)
-
-    result = [values[0]]
-
-    for price in values[1:]:
-
-        value = (
-            (price - result[-1])
-            * multiplier
-            + result[-1]
-        )
-
-        result.append(value)
+    for value in values[1:]:
+        result = (value - result) * multiplier + result
 
     return result
 
 
-# ============================================================
-# RSI
-# ============================================================
-
-def rsi(values, period=14):
-
-    if len(values) < period + 1:
-        return 50.0
+def rsi(values, length=14):
+    if len(values) < length + 1:
+        return None
 
     gains = []
     losses = []
 
     for i in range(1, len(values)):
-
         change = values[i] - values[i - 1]
+        gains.append(max(change, 0))
+        losses.append(abs(min(change, 0)))
 
-        gains.append(
-            max(change, 0.0)
-        )
+    average_gain = sum(gains[-length:]) / length
+    average_loss = sum(losses[-length:]) / length
 
-        losses.append(
-            max(-change, 0.0)
-        )
-
-    avg_gain = sum(
-        gains[:period]
-    ) / period
-
-    avg_loss = sum(
-        losses[:period]
-    ) / period
-
-    for i in range(period, len(gains)):
-
-        avg_gain = (
-            (avg_gain * (period - 1))
-            + gains[i]
-        ) / period
-
-        avg_loss = (
-            (avg_loss * (period - 1))
-            + losses[i]
-        ) / period
-
-    if avg_loss == 0:
-
-        if avg_gain == 0:
-            return 50.0
-
+    if average_loss == 0:
         return 100.0
 
-    relative_strength = (
-        avg_gain / avg_loss
-    )
-
-    return 100.0 - (
-        100.0
-        / (1.0 + relative_strength)
-    )
+    relative_strength = average_gain / average_loss
+    return 100 - (100 / (1 + relative_strength))
 
 
-# ============================================================
-# MACD
-# ============================================================
+def macd(values, fast_length=12, slow_length=26, signal_length=9):
+    if len(values) < slow_length + signal_length:
+        return None, None, None
 
-def macd(values):
+    macd_values = []
 
-    ema12 = ema(
-        values,
-        12
-    )
+    for end in range(slow_length, len(values) + 1):
+        subset = values[:end]
+        fast_ema = ema(subset[-fast_length:], fast_length)
+        slow_ema = ema(subset[-slow_length:], slow_length)
 
-    ema26 = ema(
-        values,
-        26
-    )
+        if fast_ema is not None and slow_ema is not None:
+            macd_values.append(fast_ema - slow_ema)
 
-    macd_line = [
-        a - b
-        for a, b in zip(
-            ema12,
-            ema26
-        )
-    ]
+    if len(macd_values) < signal_length:
+        return None, None, None
 
-    signal_line = ema(
-        macd_line,
-        9
-    )
+    macd_line = macd_values[-1]
+    signal_line = ema(macd_values[-signal_length:], signal_length)
+    histogram = macd_line - signal_line
 
-    if not macd_line:
-        return 0.0, 0.0
+    return macd_line, signal_line, histogram
 
-    return (
-        macd_line[-1],
-        signal_line[-1]
-    )
-
-
-# ============================================================
-# DISCORD
-# ============================================================
-
-def send_discord(embed):
-
-    if not DISCORD_WEBHOOK:
-        print("ERROR: DISCORD_WEBHOOK is missing.", flush=True)
-        return False
-
-    payload = {"username": "Cash Gang BTC Radar", "embeds": [embed]}
-    data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        DISCORD_WEBHOOK,
-        data=data,
-        headers={"Content-Type": "application/json", "User-Agent": "PKLA-BTC-Radar/2.0"},
-        method="POST"
-    )
-
-    try:
-        print("POSTING CANDLE ANALYSIS TO DISCORD...", flush=True)
-        with urllib.request.urlopen(request, timeout=15) as response:
-            status = response.status
-            print(f"DISCORD HTTP STATUS: {status}", flush=True)
-            if 200 <= status < 300:
-                print("DISCORD ACCEPTED MESSAGE.", flush=True)
-                return True
-            print("DISCORD DID NOT ACCEPT MESSAGE.", flush=True)
-            return False
-    except urllib.error.HTTPError as error:
-        print(f"DISCORD HTTP ERROR: {error.code} {error.reason}", flush=True)
-        try:
-            details = error.read().decode("utf-8", errors="replace")
-            print(f"Discord response body: {details}", flush=True)
-        except Exception:
-            pass
-        return False
-    except Exception as error:
-        print(f"DISCORD ERROR: {repr(error)}", flush=True)
-        return False
-
-
-# ============================================================
-# GET BTC CANDLES
-# ============================================================
 
 def get_btc_candles():
+    url = "https://api.binance.com/api/v3/klines"
+    params = {
+        "symbol": SYMBOL,
+        "interval": INTERVAL,
+        "limit": CANDLE_LIMIT,
+    }
 
-    candles = get_json(
-        BINANCE_URL
-    )
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
+    data = response.json()
 
-    if not candles:
-
-        raise RuntimeError(
-            "Binance returned no candles."
+    candles = []
+    for candle in data:
+        candles.append(
+            {
+                "open_time": int(candle[0]),
+                "open": float(candle[1]),
+                "high": float(candle[2]),
+                "low": float(candle[3]),
+                "close": float(candle[4]),
+                "volume": float(candle[5]),
+            }
         )
 
     return candles
 
 
-# ============================================================
-# ANALYZE BTC
-# ============================================================
+def build_radar_embed(candles):
+    closed_candles = candles[:-1]
 
-def analyze_btc():
+    if len(closed_candles) < 50:
+        raise ValueError("Not enough completed 15-minute candles yet.")
 
-    candles = get_btc_candles()
+    latest = closed_candles[-1]
+    closes = [item["close"] for item in closed_candles]
+    volumes = [item["volume"] for item in closed_candles]
 
-    closed = candles[:-1]
+    current_price = latest["close"]
+    current_rsi = rsi(closes, 14)
+    ema9 = ema(closes[-9:], 9)
+    ema21 = ema(closes[-21:], 21)
+    ema40 = ema(closes[-40:], 40)
 
-    if len(closed) < 50:
+    macd_line, macd_signal, macd_histogram = macd(closes, 12, 26, 9)
 
-        raise RuntimeError(
-            "Not enough closed candles."
-        )
+    average_volume = sum(volumes[-21:-1]) / 20
+    volume_ratio = latest["volume"] / average_volume if average_volume else 1
 
-    opens = [
-        float(candle[1])
-        for candle in closed
-    ]
-
-    highs = [
-        float(candle[2])
-        for candle in closed
-    ]
-
-    lows = [
-        float(candle[3])
-        for candle in closed
-    ]
-
-    closes = [
-        float(candle[4])
-        for candle in closed
-    ]
-
-    volumes = [
-        float(candle[5])
-        for candle in closed
-    ]
-
-    candle_times = [
-        int(candle[0])
-        for candle in closed
-    ]
-
-    price = closes[-1]
-
-    previous_price = closes[-2]
-
-    current_open = opens[-1]
-
-    current_high = highs[-1]
-
-    current_low = lows[-1]
-
-    current_volume = volumes[-1]
-
-    ema9_values = ema(
-        closes,
-        9
-    )
-
-    ema21_values = ema(
-        closes,
-        21
-    )
-
-    ema40_values = ema(
-        closes,
-        40
-    )
-
-    ema9 = ema9_values[-1]
-
-    ema21 = ema21_values[-1]
-
-    ema40 = ema40_values[-1]
-
-    current_rsi = rsi(
-        closes,
-        14
-    )
-
-    macd_value, macd_signal = macd(
-        closes
-    )
-
-    volume_window = volumes[-21:-1]
-
-    average_volume = (
-        sum(volume_window)
-        / len(volume_window)
-        if volume_window
-        else current_volume
-    )
-
-    relative_volume = (
-        current_volume
-        / average_volume
-        if average_volume > 0
-        else 1.0
-    )
-
-    candle_range = max(
-        current_high - current_low,
-        0.01
-    )
-
-    candle_body = abs(
-        price - current_open
-    )
-
-    close_position = (
-        (price - current_low)
-        / candle_range
-    )
-
-    bullish_candle = price > current_open
-
-    bearish_candle = price < current_open
-
-    recent_change = (
-        price - closes[-4]
-    )
-
-    bullish_momentum = recent_change > 0
-
-    bearish_momentum = recent_change < 0
-
-    previous_highs = highs[-21:-1]
-
-    previous_lows = lows[-21:-1]
-
-    previous_high = max(
-        previous_highs
-    )
-
-    previous_low = min(
-        previous_lows
-    )
-
-    breakout_up = (
-        price > previous_high
-    )
-
-    breakout_down = (
-        price < previous_low
-    )
-
-    bullish_score = 0
-
-    bearish_score = 0
-
-    reasons = []
+    bullish = 0
+    bearish = 0
+    analysis = []
 
     if ema9 > ema21:
-
-        bullish_score += 2
-
-        reasons.append(
-            "🟢 EMA9 > EMA21"
-        )
-
+        bullish += 1
+        analysis.append("🟢 EMA9 > EMA21")
     else:
+        bearish += 1
+        analysis.append("🔴 EMA9 < EMA21")
 
-        bearish_score += 2
-
-        reasons.append(
-            "🔴 EMA9 < EMA21"
-        )
-
-    if price > ema40:
-
-        bullish_score += 2
-
-        reasons.append(
-            "🟢 BTC above EMA40"
-        )
-
+    if current_price > ema40:
+        bullish += 1
+        analysis.append("🟢 BTC above EMA40")
     else:
+        bearish += 1
+        analysis.append("🔴 BTC below EMA40")
 
-        bearish_score += 2
-
-        reasons.append(
-            "🔴 BTC below EMA40"
-        )
-
-    if current_rsi >= 55:
-
-        bullish_score += 2
-
-        reasons.append(
-            f"🟢 RSI bullish ({current_rsi:.1f})"
-        )
-
-    elif current_rsi <= 45:
-
-        bearish_score += 2
-
-        reasons.append(
-            f"🔴 RSI bearish ({current_rsi:.1f})"
-        )
-
-    elif current_rsi > 50:
-
-        bullish_score += 1
-
-        reasons.append(
-            f"🟢 RSI slightly bullish ({current_rsi:.1f})"
-        )
-
+    if current_rsi >= 55 and current_rsi < 75:
+        bullish += 1
+        analysis.append(f"🟢 RSI bullish ({current_rsi:.1f})")
+    elif current_rsi <= 45 and current_rsi > 25:
+        bearish += 1
+        analysis.append(f"🔴 RSI bearish ({current_rsi:.1f})")
+    elif current_rsi >= 75:
+        bearish += 1
+        analysis.append(f"🟡 RSI overbought ({current_rsi:.1f})")
+    elif current_rsi <= 25:
+        bullish += 1
+        analysis.append(f"🟡 RSI oversold ({current_rsi:.1f})")
     else:
+        analysis.append(f"⚪ RSI neutral ({current_rsi:.1f})")
 
-        bearish_score += 1
-
-        reasons.append(
-            f"🔴 RSI slightly bearish ({current_rsi:.1f})"
-        )
-
-    if macd_value > macd_signal:
-
-        bullish_score += 2
-
-        reasons.append(
-            "🟢 MACD bullish"
-        )
-
+    if macd_line > macd_signal:
+        bullish += 1
+        analysis.append("🟢 MACD bullish")
     else:
+        bearish += 1
+        analysis.append("🔴 MACD bearish")
 
-        bearish_score += 2
-
-        reasons.append(
-            "🔴 MACD bearish"
-        )
-
-    if relative_volume >= 1.15:
-
-        if bullish_candle:
-
-            bullish_score += 2
-
-            reasons.append(
-                f"🟢 Strong bullish volume ({relative_volume:.2f}x)"
-            )
-
-        elif bearish_candle:
-
-            bearish_score += 2
-
-            reasons.append(
-                f"🔴 Strong bearish volume ({relative_volume:.2f}x)"
-            )
-
-    elif relative_volume < 0.80:
-
-        reasons.append(
-            f"⚪ Low volume ({relative_volume:.2f}x)"
-        )
-
+    if macd_histogram > 0:
+        bullish += 1
     else:
+        bearish += 1
 
-        reasons.append(
-            f"⚪ Normal volume ({relative_volume:.2f}x)"
-        )
-
-    if candle_range > 0:
-
-        if bullish_candle and close_position >= 0.70:
-
-            bullish_score += 1
-
-            reasons.append(
-                "🟢 Strong bullish candle close"
-            )
-
-        elif bearish_candle and close_position <= 0.30:
-
-            bearish_score += 1
-
-            reasons.append(
-                "🔴 Strong bearish candle close"
-            )
-
-    if bullish_momentum:
-
-        bullish_score += 1
-
-        reasons.append(
-            "🟢 Short-term momentum UP"
-        )
-
-    elif bearish_momentum:
-
-        bearish_score += 1
-
-        reasons.append(
-            "🔴 Short-term momentum DOWN"
-        )
-
-    if breakout_up:
-
-        bullish_score += 3
-
-        reasons.append(
-            "🚀 Upside range breakout"
-        )
-
-    elif breakout_down:
-
-        bearish_score += 3
-
-        reasons.append(
-            "📉 Downside range breakout"
-        )
-
-    score_gap = abs(
-        bullish_score
-        - bearish_score
-    )
-
-    strongest_score = max(
-        bullish_score,
-        bearish_score
-    )
-
-    if (
-        bullish_score >= 8
-        and bullish_score > bearish_score
-    ):
-
-        signal = "⬆️ BET UP"
-
-        direction = "UP"
-
-    elif (
-        bearish_score >= 8
-        and bearish_score > bullish_score
-    ):
-
-        signal = "⬇️ BET DOWN"
-
-        direction = "DOWN"
-
+    if volume_ratio >= 1.25:
+        if bullish >= bearish:
+            bullish += 1
+            analysis.append(f"🟢 Strong bullish volume ({volume_ratio:.2f}x)")
+        else:
+            bearish += 1
+            analysis.append(f"🔴 Strong bearish volume ({volume_ratio:.2f}x)")
     else:
+        analysis.append(f"⚪ Normal volume ({volume_ratio:.2f}x)")
 
-        signal = "⏸️ NO TRADE"
+    gap = bullish - bearish
+    confidence = min(95, max(50, 50 + abs(gap) * 9))
 
-        direction = "NONE"
-
-    if direction in ("UP", "DOWN"):
-
-        confidence = (
-            50
-            + (score_gap * 5)
-            + max(
-                0,
-                strongest_score - 8
-            ) * 3
-        )
-
-    else:
-
-        confidence = 50
-
-    confidence = int(
-        max(
-            50,
-            min(
-                95,
-                confidence
-            )
-        )
-    )
-
-    if confidence >= 80:
-
-        hold_candles = 2
-
-    else:
-
-        hold_candles = 1
-
-    recent_ranges = [
-        highs[i] - lows[i]
-        for i in range(
-            max(0, len(highs) - 14),
-            len(highs)
-        )
-    ]
-
-    average_range = (
-        sum(recent_ranges)
-        / len(recent_ranges)
-        if recent_ranges
-        else candle_range
-    )
-
-    if average_range <= 0:
-
-        average_range = candle_range
-
-    if direction == "UP":
-
-        entry = price
-
-        take_profit = (
-            price
-            + average_range * 1.30
-        )
-
-        stop_loss = (
-            price
-            - average_range * 0.90
-        )
-
-    elif direction == "DOWN":
-
-        entry = price
-
-        take_profit = (
-            price
-            - average_range * 1.30
-        )
-
-        stop_loss = (
-            price
-            + average_range * 0.90
-        )
-
-    else:
-
-        entry = price
-
-        take_profit = price
-
-        stop_loss = price
-
-    candle_timestamp = candle_times[-1]
-
-    candle_datetime = datetime.fromtimestamp(
-        candle_timestamp / 1000,
-        tz=timezone.utc
-    )
-
-    return {
-        "price": price,
-        "signal": signal,
-        "direction": direction,
-        "confidence": confidence,
-        "bullish_score": bullish_score,
-        "bearish_score": bearish_score,
-        "score_gap": score_gap,
-        "rsi": current_rsi,
-        "macd": macd_value,
-        "macd_signal": macd_signal,
-        "ema9": ema9,
-        "ema21": ema21,
-        "ema40": ema40,
-        "relative_volume": relative_volume,
-        "previous_high": previous_high,
-        "previous_low": previous_low,
-        "breakout_up": breakout_up,
-        "breakout_down": breakout_down,
-        "entry": entry,
-        "take_profit": take_profit,
-        "stop_loss": stop_loss,
-        "hold_candles": hold_candles,
-        "reasons": reasons,
-        "candle_timestamp": candle_timestamp,
-        "candle_datetime": candle_datetime
-    }
-
-
-# ============================================================
-# BUILD DISCORD MESSAGE
-# ============================================================
-
-def build_embed(result):
-
-    signal = result["signal"]
-
-    direction = result["direction"]
-
-    confidence = result["confidence"]
-
-    price = result["price"]
-
-    if direction == "UP":
-
+    if gap >= 2:
+        signal = "BET UP"
         title = "🟢 BTC UP SIGNAL"
-
-    elif direction == "DOWN":
-
+        color = 0x2ECC71
+        hold_candles = 2
+        entry = current_price
+        take_profit = current_price * 1.0058
+        stop_loss = current_price * 0.9960
+    elif gap <= -2:
+        signal = "BET DOWN"
         title = "🔴 BTC DOWN SIGNAL"
-
+        color = 0xE74C3C
+        hold_candles = 2
+        entry = current_price
+        take_profit = current_price * 0.9942
+        stop_loss = current_price * 1.0040
     else:
+        signal = "NO TRADE"
+        title = "🟡 BTC WAIT SIGNAL"
+        color = 0xF1C40F
+        hold_candles = 1
+        entry = current_price
+        take_profit = current_price
+        stop_loss = current_price
 
-        title = "⚪ BTC NO TRADE"
+    candle_time = datetime.fromtimestamp(
+        latest["open_time"] / 1000, tz=timezone.utc
+    ).strftime("%Y-%m-%d %I:%M %p UTC")
 
-    reasons_text = "\n".join(
-        result["reasons"]
+    description = (
+        "**PKLA BTC 15-Minute Market Radar**\n"
+        "Automated technical analysis\n\n"
+        "₿ **BTC PRICE**\n"
+        f"**{round_price(current_price)}**\n\n"
+        "📊 **SIGNAL**\n"
+        f"**{signal}**\n\n"
+        "🎯 **CONFIDENCE**\n"
+        f"**{confidence}%**\n\n"
+        "🕯️ **HOLD**\n"
+        f"**{hold_candles} candle(s)**\n\n"
+        "📈 **SCORE**\n"
+        f"Bullish: **{bullish}**\n"
+        f"Bearish: **{bearish}**\n"
+        f"Gap: **{gap:+d}**\n\n"
+        "📐 **INDICATORS**\n"
+        f"RSI: **{current_rsi:.1f}**\n"
+        f"MACD: **{macd_line:.2f}**\n"
+        f"Signal: **{macd_signal:.2f}**\n"
+        f"EMA9: **{round_price(ema9)}**\n"
+        f"EMA21: **{round_price(ema21)}**\n"
+        f"EMA40: **{round_price(ema40)}**\n\n"
+        "📍 **TRADE LEVELS**\n"
+        f"Entry: **{round_price(entry)}**\n"
+        f"Take Profit: **{round_price(take_profit)}**\n"
+        f"Stop Loss: **{round_price(stop_loss)}**\n\n"
+        "🔬 **ANALYSIS**\n"
+        + "\n".join(analysis)
     )
 
     embed = {
-
         "title": title,
-
-        "description": (
-            "**PKLA BTC 15-Minute Market Radar**\n"
-            "Automated technical analysis"
-        ),
-
-        "color": (
-            5763719
-            if direction == "UP"
-            else
-            15548997
-            if direction == "DOWN"
-            else
-            9807270
-        ),
-
-        "fields": [
-
-            {
-                "name": "₿ BTC PRICE",
-                "value": f"**${price:,.2f}**",
-                "inline": False
-            },
-
-            {
-                "name": "📊 SIGNAL",
-                "value": f"**{signal}**",
-                "inline": True
-            },
-
-            {
-                "name": "🎯 CONFIDENCE",
-                "value": f"**{confidence}%**",
-                "inline": True
-            },
-
-            {
-                "name": "🕯 HOLD",
-                "value": f"**{result['hold_candles']} candle(s)**",
-                "inline": True
-            },
-
-            {
-                "name": "📈 SCORE",
-                "value": (
-                    f"Bullish: **{result['bullish_score']}**\n"
-                    f"Bearish: **{result['bearish_score']}**\n"
-                    f"Gap: **{result['score_gap']}**"
-                ),
-                "inline": True
-            },
-
-            {
-                "name": "📐 INDICATORS",
-                "value": (
-                    f"RSI: **{result['rsi']:.1f}**\n"
-                    f"MACD: **{result['macd']:.2f}**\n"
-                    f"Signal: **{result['macd_signal']:.2f}**\n"
-                    f"EMA9: **${result['ema9']:,.2f}**\n"
-                    f"EMA21: **${result['ema21']:,.2f}**\n"
-                    f"EMA40: **${result['ema40']:,.2f}**"
-                ),
-                "inline": False
-            },
-
-            {
-                "name": "📍 TRADE LEVELS",
-                "value": (
-                    f"Entry: **${result['entry']:,.2f}**\n"
-                    f"Take Profit: **${result['take_profit']:,.2f}**\n"
-                    f"Stop Loss: **${result['stop_loss']:,.2f}**"
-                ),
-                "inline": False
-            },
-
-            {
-                "name": "🔬 ANALYSIS",
-                "value": reasons_text,
-                "inline": False
-            },
-
-            {
-                "name": "📊 RANGE",
-                "value": (
-                    f"Previous High: **${result['previous_high']:,.2f}**\n"
-                    f"Previous Low: **${result['previous_low']:,.2f}**\n"
-                    f"Relative Volume: **{result['relative_volume']:.2f}x**"
-                ),
-                "inline": False
-            }
-        ],
-
-        "footer": {
-            "text": (
-                "PKLA Signal Hub • "
-                "BTC • RSI • MACD • EMA • Volume"
-            )
-        },
-
-        "timestamp": datetime.now(
-            timezone.utc
-        ).isoformat()
+        "description": description,
+        "color": color,
+        "footer": {"text": f"{SYMBOL} • Confirmed 15-minute candle • {candle_time}"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    return embed
+    return embed, latest["open_time"], signal
 
 
-# ============================================================
-# SEND SIGNAL
-# ============================================================
+def send_discord_embed(embed):
+    if not DISCORD_WEBHOOK_URL:
+        raise ValueError("DISCORD_WEBHOOK_URL is missing in Render Environment.")
 
-def send_signal(result):
-
-    """Send every candle analysis to Discord."""
-    print(f"Sending candle analysis to Discord: {result['signal']}", flush=True)
-    success = send_discord(build_embed(result))
-    if success:
-        print("DISCORD SEND CONFIRMED - candle analysis delivered.", flush=True)
-        return True
-    print("DISCORD SEND FAILED - candle will be retried.", flush=True)
-    return False
+    response = requests.post(
+        DISCORD_WEBHOOK_URL,
+        json={"embeds": [embed]},
+        timeout=20,
+    )
+    response.raise_for_status()
 
 
-# ============================================================
-# MAIN RADAR LOOP
-# ============================================================
+def radar_loop():
+    global last_radar_candle_time, last_radar_sent_at, last_radar_error
 
-def run_radar():
-
-    print("==========================================", flush=True)
-    print("       PKLA BTC DISCORD RADAR", flush=True)
-    print("==========================================", flush=True)
-    print("Data: Binance", flush=True)
-    print("Market: BTCUSDT", flush=True)
-    print("Timeframe: 15M", flush=True)
-    print("TradingView webhook: NOT REQUIRED", flush=True)
-    print("Discord: ENABLED", flush=True)
-    print("Every closed candle: SEND", flush=True)
-    print("NO TRADE candles: SEND", flush=True)
-    print(f"Check interval: {CHECK_INTERVAL}s", flush=True)
-    print("==========================================", flush=True)
-
-    if not DISCORD_WEBHOOK:
-        print("WARNING: DISCORD_WEBHOOK is missing.", flush=True)
-    else:
-        print("Discord webhook: CONFIGURED", flush=True)
-
-    last_processed_candle = None
+    time.sleep(15)
 
     while True:
         try:
-            print("\nChecking Binance for new closed 15M candle...", flush=True)
             candles = get_btc_candles()
-            if not candles or len(candles) < 3:
-                print("Not enough Binance candle data.", flush=True)
-                time.sleep(CHECK_INTERVAL)
-                continue
+            embed, candle_time, signal = build_radar_embed(candles)
 
-            latest_closed = candles[-2]
-            candle_timestamp = int(latest_closed[0])
-            candle_datetime = datetime.fromtimestamp(candle_timestamp / 1000, tz=timezone.utc)
-            print("Latest closed candle:", candle_datetime.isoformat(), flush=True)
+            should_send = candle_time != last_radar_candle_time
 
-            if last_processed_candle == candle_timestamp:
-                print("No new closed 15M candle yet.", flush=True)
-                time.sleep(CHECK_INTERVAL)
-                continue
+            if signal == "NO TRADE" and not SEND_NO_TRADE:
+                should_send = False
 
-            print("\n==========================================", flush=True)
-            print("NEW CLOSED 15M CANDLE DETECTED!", flush=True)
-            print(f"Candle: {candle_datetime.isoformat()}", flush=True)
-            print("Analyzing BTC...", flush=True)
+            if should_send:
+                send_discord_embed(embed)
+                last_radar_candle_time = candle_time
+                last_radar_sent_at = datetime.now(timezone.utc).isoformat()
+                last_radar_error = None
+                print(f"Radar sent: {signal} for candle {candle_time}", flush=True)
 
-            result = analyze_btc()
-            print("Price:", f"${result['price']:,.2f}", flush=True)
-            print("Signal:", result["signal"], flush=True)
-            print("Confidence:", f"{result['confidence']}%", flush=True)
-            print("Bullish score:", result["bullish_score"], flush=True)
-            print("Bearish score:", result["bearish_score"], flush=True)
-            print(f"Candle being sent: {candle_datetime.isoformat()}", flush=True)
-
-            sent = send_signal(result)
-            if sent:
-                last_processed_candle = candle_timestamp
-                print("CANDLE PROCESSING COMPLETE.", flush=True)
-                print("Discord send confirmed.", flush=True)
-                print(f"Processed candle timestamp: {candle_timestamp}", flush=True)
-            else:
-                print("WARNING: Discord send failed.", flush=True)
-                print("This candle is NOT marked processed.", flush=True)
-                print("It will automatically retry on the next check.", flush=True)
-
-            print("==========================================", flush=True)
-
-        except urllib.error.HTTPError as error:
-            print("Binance HTTP error:", error, flush=True)
-            print("Will retry automatically.", flush=True)
-        except urllib.error.URLError as error:
-            print("Binance network error:", error, flush=True)
-            print("Will retry automatically.", flush=True)
         except Exception as error:
-            print("RADAR ERROR:", repr(error), flush=True)
-            print("Radar loop is still running.", flush=True)
+            last_radar_error = str(error)
+            print(f"Radar error: {error}", flush=True)
 
-        time.sleep(CHECK_INTERVAL)
+        time.sleep(60)
 
 
-# ============================================================
-# START
-# ============================================================
+@app.get("/")
+def home():
+    return jsonify(
+        {
+            "service": "btc-discord-radar",
+            "status": "running",
+            "symbol": SYMBOL,
+            "interval": INTERVAL,
+            "last_radar_sent_at": last_radar_sent_at,
+            "last_radar_error": last_radar_error,
+        }
+    )
+
+
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
+
+
+@app.post("/webhook")
+def webhook():
+    payload = request.get_json(silent=True) or {}
+
+    supplied_secret = str(payload.get("secret", "")).strip()
+
+    if WEBHOOK_SECRET and supplied_secret != WEBHOOK_SECRET:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+
+    signal = str(payload.get("signal", "SIGNAL")).upper()
+    ticker = str(payload.get("ticker", SYMBOL))
+    price = str(payload.get("price", "N/A"))
+    timeframe = str(payload.get("timeframe", "N/A"))
+    event_time = str(payload.get("time", datetime.now(timezone.utc).isoformat()))
+
+    is_buy = any(word in signal for word in ["BUY", "UP", "LONG"])
+    color = 0x2ECC71 if is_buy else 0xE74C3C
+
+    embed = {
+        "title": f"{'🟢' if is_buy else '🔴'} {ticker} {signal}",
+        "description": (
+            f"**Price:** {price}\n"
+            f"**Timeframe:** {timeframe}\n"
+            f"**Time:** {event_time}"
+        ),
+        "color": color,
+        "footer": {"text": "TradingView webhook signal"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        send_discord_embed(embed)
+        return jsonify({"ok": True, "message": "Discord signal sent"})
+    except Exception as error:
+        return jsonify({"ok": False, "error": str(error)}), 500
+
 
 if __name__ == "__main__":
+    threading.Thread(target=radar_loop, daemon=True).start()
 
-    # Start Flask so Render detects an open port.
-    threading.Thread(
-        target=start_web_server,
-        daemon=True
-    ).start()
-
-    # Start the BTC radar.
-    run_radar()
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
