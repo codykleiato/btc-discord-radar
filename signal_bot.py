@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
 
-SEND_NO_TRADE = os.environ.get("SEND_NO_TRADE", "1") == "1"
+SEND_NO_TRADE = os.environ.get("SEND_NO_TRADE", "0") == "1"
 
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "10"))
 
@@ -81,7 +81,6 @@ def test_discord():
     success = send_discord(embed)
 
     if success:
-
         return {
             "status": "success",
             "message": "Test message sent to Discord"
@@ -297,11 +296,8 @@ def send_discord(embed):
     ).encode("utf-8")
 
     request = urllib.request.Request(
-
         DISCORD_WEBHOOK,
-
         data=data,
-
         headers={
             "Content-Type":
                 "application/json",
@@ -309,7 +305,6 @@ def send_discord(embed):
             "User-Agent":
                 "PKLA-BTC-Radar/2.0"
         },
-
         method="POST"
     )
 
@@ -953,6 +948,7 @@ def build_embed(result):
                 ),
                 "inline": False
             }
+
         ],
 
         "footer": {
@@ -973,19 +969,22 @@ def build_embed(result):
 # ============================================================
 # SEND SIGNAL
 # ============================================================
+# IMPORTANT:
+# EVERY CLOSED CANDLE IS NOW SENT TO DISCORD.
+#
+# This includes:
+#   ⬆️ BET UP
+#   ⬇️ BET DOWN
+#   ⏸️ NO TRADE
+#
+# There is NO longer a skip for NO TRADE.
+# ============================================================
 
 def send_signal(result):
 
-    if (
-        result["direction"] == "NONE"
-        and not SEND_NO_TRADE
-    ):
-
-        print(
-            "NO TRADE signal - Discord message skipped."
-        )
-
-        return
+    print(
+        "Sending candle analysis to Discord..."
+    )
 
     embed = build_embed(
         result
@@ -998,7 +997,13 @@ def send_signal(result):
     if success:
 
         print(
-            "Signal successfully sent to Discord."
+            "Candle analysis successfully sent to Discord."
+        )
+
+    else:
+
+        print(
+            "ERROR: Candle analysis failed to send to Discord."
         )
 
 
@@ -1128,6 +1133,7 @@ def run_radar():
                 result["bearish_score"]
             )
 
+            # SEND EVERY CANDLE ANALYSIS
             send_signal(
                 result
             )
