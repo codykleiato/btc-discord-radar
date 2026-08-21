@@ -8,13 +8,24 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-BTC_ALERT_ABOVE = float(os.getenv("BTC_ALERT_ABOVE", "100000"))
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "").strip()
+
+try:
+    BTC_ALERT_ABOVE = float(os.getenv("BTC_ALERT_ABOVE", "100000"))
+except ValueError:
+    BTC_ALERT_ABOVE = 100000.0
+
+try:
+    CHECK_INTERVAL_SECONDS = max(30, int(os.getenv("CHECK_INTERVAL_SECONDS", "60")))
+except ValueError:
+    CHECK_INTERVAL_SECONDS = 60
 
 last_price = None
 last_checked_at = None
+last_error = None
 last_alert_state = None
+monitor_started = False
 
 
 @app.route("/")
@@ -26,6 +37,7 @@ def home():
             "last_price_usd": last_price,
             "last_checked_at": last_checked_at,
             "alert_above_usd": BTC_ALERT_ABOVE,
+            "last_error": last_error,
         }
     )
 
@@ -36,13 +48,19 @@ def health():
 
 
 def get_btc_price():
+    headers = {}
+
+    if COINGECKO_API_KEY:
+        headers["x-cg-demo-api-key"] = COINGECKO_API_KEY
+
     response = requests.get(
         "https://api.coingecko.com/api/v3/simple/price",
         params={
             "ids": "bitcoin",
             "vs_currencies": "usd",
         },
-        timeout=15,
+        headers=headers,
+        timeout=20,
     )
     response.raise_for_status()
 
@@ -52,19 +70,20 @@ def get_btc_price():
 
 def send_discord_message(message):
     if not DISCORD_WEBHOOK_URL:
-        print("DISCORD_WEBHOOK_URL is not set; alert was skipped.")
-        return
+        print("DISCORD_WEBHOOK_URL is not set; Discord alert skipped.", flush=True)
+        return False
 
     response = requests.post(
         DISCORD_WEBHOOK_URL,
         json={"content": message},
-        timeout=15,
+        timeout=20,
     )
     response.raise_for_status()
+    return True
 
 
 def check_btc_price():
-    global last_price, last_checked_at, last_alert_state
+    global last_price, last_checked_at, last_error, last_alert_state
 
     try:
         price = get_btc_price()
@@ -72,51 +91,74 @@ def check_btc_price():
 
         last_price = price
         last_checked_at = checked_at
+        last_error = None
 
         is_above_target = price >= BTC_ALERT_ABOVE
 
         print(
-            f"[{checked_at}] BTC price: ${price:,.2f} | "
-            f"Target: ${BTC_ALERT_ABOVE:,.2f}"
+            f"[{checked_at}] BTC: ${price:,.2f} | "
+            f"Target: ${BTC_ALERT_ABOVE:,.2f}",
+            flush=True,
         )
 
         if is_above_target and last_alert_state is not True:
-            send_discord_message(
+            sent = send_discord_message(
                 f"🚨 **Bitcoin Price Alert**\n"
-                f"BTC is **${price:,.2f} USD**.\n"
-                f"It is above your target of **${BTC_ALERT_ABOVE:,.2f} USD**."
+                f"BTC price: **${price:,.2f} USD**\n"
+                f"Target: **${BTC_ALERT_ABOVE:,.2f} USD**"
             )
-            print("Above-target Discord alert sent.")
+            if sent:
+                print("Above-target Discord alert sent.", flush=True)
 
         elif not is_above_target and last_alert_state is True:
-            send_discord_message(
+            sent = send_discord_message(
                 f"📉 **Bitcoin Price Update**\n"
-                f"BTC is **${price:,.2f} USD**.\n"
-                f"It is back below **${BTC_ALERT_ABOVE:,.2f} USD**."
+                f"BTC price: **${price:,.2f} USD**\n"
+                f"BTC is back below **${BTC_ALERT_ABOVE:,.2f} USD**."
             )
-            print("Below-target Discord alert sent.")
+            if sent:
+                print("Below-target Discord update sent.", flush=True)
 
         last_alert_state = is_above_target
 
     except requests.RequestException as error:
-        print(f"BTC price or Discord request failed: {error}")
+        last_error = f"Request error: {error}"
+        print(last_error, flush=True)
 
     except (KeyError, TypeError, ValueError) as error:
-        print(f"Invalid BTC API response: {error}")
+        last_error = f"Price-data error: {error}"
+        print(last_error, flush=True)
 
     except Exception as error:
-        print(f"Unexpected monitor error: {error}")
+        last_error = f"Unexpected error: {error}"
+        print(last_error, flush=True)
 
 
 def price_monitor():
+    print(
+        f"BTC monitor started; checking every {CHECK_INTERVAL_SECONDS} seconds.",
+        flush=True,
+    )
+
     while True:
         check_btc_price()
         time.sleep(CHECK_INTERVAL_SECONDS)
 
 
-if __name__ == "__main__":
-    monitor_thread = threading.Thread(target=price_monitor, daemon=True)
-    monitor_thread.start()
+def start_monitor():
+    global monitor_started
 
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    if monitor_started:
+        return
+
+    monitor_started = True
+
+    thread = threading.Thread(
+        target=price_monitor,
+        name="btc-price-monitor",
+        daemon=True,
+    )
+    thread.start()
+
+
+start_monitor()
