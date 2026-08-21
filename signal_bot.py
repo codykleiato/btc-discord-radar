@@ -5,46 +5,70 @@ import urllib.request
 import urllib.error
 import threading
 from datetime import datetime, timezone
-from flask import Flask
+
+from flask import Flask, jsonify
+
 
 # ============================================================
 # PKLA BTC DISCORD RADAR
 # Coinbase BTC-USD / 15M
-# Discord delivery uses BOT REST API, NOT a webhook.
 #
-# Features:
-# - BTC 15-minute closed-candle analysis
-# - Discord Bot API
-# - Discord 429 retry/backoff
-# - /test endpoint
-# - Sends a result every 15-minute candle
+# Discord delivery uses the BOT REST API.
+#
+# SEND EVERY 15 MINUTES:
+#   The radar checks every 10 seconds, but only analyzes/sends
+#   when a NEW CLOSED 15-minute candle is detected.
+#
+# Discord delivery:
+#   - Persistent retry/backoff
+#   - Honors Discord Retry-After
+#   - Handles HTTP 429 / Cloudflare Error 1015
+#   - Handles network errors
+#   - /test endpoint for manual Discord testing
+# ============================================================
+
+
+# ============================================================
+# ENVIRONMENT
 # ============================================================
 
 DISCORD_BOT_TOKEN = os.environ.get(
-    "DISCORD_BOT_TOKEN", ""
+    "DISCORD_BOT_TOKEN",
+    ""
 ).strip()
 
 DISCORD_CHANNEL_ID = os.environ.get(
-    "DISCORD_CHANNEL_ID", ""
+    "DISCORD_CHANNEL_ID",
+    ""
 ).strip()
 
-SEND_NO_TRADE = os.environ.get(
-    "SEND_NO_TRADE", "1"
-) == "1"
+SEND_NO_TRADE = (
+    os.environ.get("SEND_NO_TRADE", "0") == "1"
+)
 
 CHECK_INTERVAL = int(
     os.environ.get("CHECK_INTERVAL", "10")
 )
 
-DISCORD_MAX_RETRIES = int(
-    os.environ.get("DISCORD_MAX_RETRIES", "5")
+# Maximum number of Discord attempts for one message.
+DISCORD_MAX_ATTEMPTS = int(
+    os.environ.get("DISCORD_MAX_ATTEMPTS", "5")
 )
 
-DISCORD_BASE_BACKOFF = float(
-    os.environ.get("DISCORD_BASE_BACKOFF", "2")
+# Maximum amount of time to wait between retries.
+DISCORD_MAX_BACKOFF = int(
+    os.environ.get("DISCORD_MAX_BACKOFF", "300")
 )
+
+# Prevent /test from being hammered.
+TEST_COOLDOWN = int(
+    os.environ.get("TEST_COOLDOWN", "60")
+)
+
 
 SYMBOL = "BTC-USD"
+
+# 900 seconds = 15 minutes.
 GRANULARITY = 900
 
 COINBASE_URL = (
@@ -52,52 +76,97 @@ COINBASE_URL = (
     f"{SYMBOL}/candles?granularity={GRANULARITY}"
 )
 
+
+# ============================================================
+# FLASK
+# ============================================================
+
 app = Flask(__name__)
 
+_last_test_time = 0.0
+_test_lock = threading.Lock()
 
-# ============================================================
-# WEB ENDPOINTS
-# ============================================================
 
 @app.route("/")
 def home():
-    return {
+    return jsonify({
         "status": "online",
         "service": "btc-discord-radar",
-        "discord": "bot_api",
+        "market": SYMBOL,
         "timeframe": "15M",
         "send_every_15m": True,
-        "test_endpoint": "/test"
-    }
+        "discord": "bot_api"
+    })
 
 
-@app.route("/test")
+@app.route("/test", methods=["GET", "POST"])
 def test_discord():
-    """
-    Immediate Discord connection test.
 
-    Open:
-    https://YOUR-RENDER-URL.onrender.com/test
-    """
+    global _last_test_time
+
+    # --------------------------------------------------------
+    # Prevent repeated manual tests from causing more
+    # Discord rate limiting.
+    # --------------------------------------------------------
+
+    with _test_lock:
+
+        now = time.time()
+
+        elapsed = now - _last_test_time
+
+        if elapsed < TEST_COOLDOWN:
+
+            remaining = int(
+                TEST_COOLDOWN - elapsed
+            ) + 1
+
+            return jsonify({
+                "status": "rate_limited_locally",
+                "message": (
+                    "Test endpoint is cooling down."
+                ),
+                "retry_after": remaining
+            }), 429
+
+        _last_test_time = now
+
+    # --------------------------------------------------------
+    # Validate configuration.
+    # --------------------------------------------------------
+
+    if not DISCORD_BOT_TOKEN:
+        return jsonify({
+            "status": "error",
+            "message": "DISCORD_BOT_TOKEN is missing."
+        }), 500
+
+    if not DISCORD_CHANNEL_ID:
+        return jsonify({
+            "status": "error",
+            "message": "DISCORD_CHANNEL_ID is missing."
+        }), 500
+
+    # --------------------------------------------------------
+    # Build test embed.
+    # --------------------------------------------------------
 
     embed = {
         "title": "🧪 PKLA BTC Radar Test",
         "description": (
             "Discord connection test.\n\n"
-            "If you can see this message in Discord, "
-            "the Render → PKLA Bot → Discord connection "
-            "is working."
+            "Render → PKLA Bot → Discord"
         ),
         "color": 5763719,
         "fields": [
             {
-                "name": "STATUS",
-                "value": "✅ Discord Bot API test",
+                "name": "Status",
+                "value": "Testing Discord Bot API",
                 "inline": False
             },
             {
-                "name": "TIMEFRAME",
-                "value": "15-minute radar",
+                "name": "Timeframe",
+                "value": "15 minutes",
                 "inline": True
             }
         ],
@@ -109,25 +178,45 @@ def test_discord():
         ).isoformat()
     }
 
+    print(
+        "Manual /test request received.",
+        flush=True
+    )
+
     success, error_detail = send_discord(
         embed,
         return_error=True
     )
 
     if success:
-        return {
-            "status": "success",
-            "message": "Test message sent to Discord"
-        }
 
-    return {
+        print(
+            "Manual Discord test succeeded.",
+            flush=True
+        )
+
+        return jsonify({
+            "status": "success",
+            "message": (
+                "Test message successfully sent to Discord."
+            )
+        })
+
+    print(
+        "Manual Discord test failed:",
+        error_detail,
+        flush=True
+    )
+
+    return jsonify({
         "status": "error",
-        "message": "Discord test failed",
+        "message": "Discord test failed.",
         "error": error_detail
-    }, 500
+    }), 500
 
 
 def start_web_server():
+
     port = int(
         os.environ.get("PORT", "10000")
     )
@@ -139,15 +228,17 @@ def start_web_server():
 
     app.run(
         host="0.0.0.0",
-        port=port
+        port=port,
+        threaded=True
     )
 
 
 # ============================================================
-# HTTP / JSON
+# GENERIC JSON REQUEST
 # ============================================================
 
 def get_json(url):
+
     request = urllib.request.Request(
         url,
         headers={
@@ -160,13 +251,14 @@ def get_json(url):
         request,
         timeout=15
     ) as response:
+
         return json.loads(
             response.read().decode("utf-8")
         )
 
 
 # ============================================================
-# COINBASE
+# GET BTC CANDLES
 # ============================================================
 
 def get_btc_candles():
@@ -181,6 +273,7 @@ def get_btc_candles():
     )
 
     if not candles:
+
         raise RuntimeError(
             "Coinbase returned no candles."
         )
@@ -210,14 +303,18 @@ def ema(values, period):
     if len(values) < period:
         return [values[0]] * len(values)
 
-    multiplier = 2.0 / (period + 1.0)
+    multiplier = 2.0 / (
+        period + 1.0
+    )
 
     result = [values[0]]
 
     for price in values[1:]:
+
         result.append(
-            (price - result[-1])
-            * multiplier
+            (
+                price - result[-1]
+            ) * multiplier
             + result[-1]
         )
 
@@ -235,7 +332,8 @@ def rsi(values, period=14):
     for i in range(1, len(values)):
 
         change = (
-            values[i] - values[i - 1]
+            values[i]
+            - values[i - 1]
         )
 
         gains.append(
@@ -256,18 +354,23 @@ def rsi(values, period=14):
         / period
     )
 
-    for i in range(period, len(gains)):
+    for i in range(
+        period,
+        len(gains)
+    ):
 
         avg_gain = (
             (
-                avg_gain * (period - 1)
+                avg_gain
+                * (period - 1)
             )
             + gains[i]
         ) / period
 
         avg_loss = (
             (
-                avg_loss * (period - 1)
+                avg_loss
+                * (period - 1)
             )
             + losses[i]
         ) / period
@@ -280,14 +383,14 @@ def rsi(values, period=14):
             else 50.0
         )
 
-    rs = avg_gain / avg_loss
+    rs = (
+        avg_gain
+        / avg_loss
+    )
 
-    return (
+    return 100.0 - (
         100.0
-        - (
-            100.0
-            / (1.0 + rs)
-        )
+        / (1.0 + rs)
     )
 
 
@@ -305,7 +408,8 @@ def macd(values):
 
     macd_line = [
         a - b
-        for a, b in zip(
+        for a, b
+        in zip(
             ema12,
             ema26
         )
@@ -317,6 +421,7 @@ def macd(values):
     )
 
     if not macd_line:
+
         return 0.0, 0.0
 
     return (
@@ -326,8 +431,90 @@ def macd(values):
 
 
 # ============================================================
+# DISCORD HELPERS
+# ============================================================
+
+def _parse_retry_after(
+    body,
+    headers,
+    fallback
+):
+
+    # --------------------------------------------------------
+    # First try Discord's Retry-After HTTP header.
+    # --------------------------------------------------------
+
+    retry_header = headers.get(
+        "Retry-After"
+    )
+
+    if retry_header:
+
+        try:
+
+            value = float(
+                retry_header
+            )
+
+            # Discord normally supplies seconds.
+            if value > 0:
+
+                return value
+
+        except (TypeError, ValueError):
+
+            pass
+
+    # --------------------------------------------------------
+    # Then inspect Discord's JSON response.
+    #
+    # We specifically handle:
+    #
+    # "retry_after": 30
+    #
+    # which appeared in your Error 1015 response.
+    # --------------------------------------------------------
+
+    try:
+
+        data = json.loads(body)
+
+        retry_after = data.get(
+            "retry_after"
+        )
+
+        if retry_after is not None:
+
+            value = float(
+                retry_after
+            )
+
+            if value > 0:
+
+                return value
+
+    except Exception:
+
+        pass
+
+    return fallback
+
+
+def _safe_error_body(body):
+
+    if not body:
+        return ""
+
+    # Don't dump an enormous response into Render logs.
+    if len(body) > 3000:
+
+        return body[:3000] + "..."
+
+    return body
+
+
+# ============================================================
 # DISCORD BOT REST API
-# WITH RETRY / BACKOFF
 # ============================================================
 
 def send_discord(
@@ -335,11 +522,14 @@ def send_discord(
     return_error=False
 ):
 
+    # --------------------------------------------------------
+    # Validate credentials.
+    # --------------------------------------------------------
+
     if not DISCORD_BOT_TOKEN:
 
         error = (
-            "DISCORD_BOT_TOKEN "
-            "is missing or empty."
+            "DISCORD_BOT_TOKEN is missing or empty."
         )
 
         print(
@@ -357,8 +547,7 @@ def send_discord(
     if not DISCORD_CHANNEL_ID:
 
         error = (
-            "DISCORD_CHANNEL_ID "
-            "is missing or empty."
+            "DISCORD_CHANNEL_ID is missing or empty."
         )
 
         print(
@@ -372,6 +561,10 @@ def send_discord(
             if return_error
             else False
         )
+
+    # --------------------------------------------------------
+    # Discord channel message endpoint.
+    # --------------------------------------------------------
 
     url = (
         "https://discord.com/api/v10/"
@@ -387,16 +580,20 @@ def send_discord(
         payload
     ).encode("utf-8")
 
+    # --------------------------------------------------------
+    # Retry loop.
+    # --------------------------------------------------------
+
     last_error = None
 
     for attempt in range(
         1,
-        DISCORD_MAX_RETRIES + 1
+        DISCORD_MAX_ATTEMPTS + 1
     ):
 
         print(
             f"Discord send attempt "
-            f"{attempt}/{DISCORD_MAX_RETRIES}...",
+            f"{attempt}/{DISCORD_MAX_ATTEMPTS}...",
             flush=True
         )
 
@@ -428,6 +625,14 @@ def send_discord(
 
                 status = response.status
 
+                response_body = (
+                    response.read()
+                    .decode(
+                        "utf-8",
+                        errors="replace"
+                    )
+                )
+
                 print(
                     "Discord Bot API response:",
                     status,
@@ -437,8 +642,7 @@ def send_discord(
                 if 200 <= status < 300:
 
                     print(
-                        "Discord message "
-                        "successfully delivered.",
+                        "Discord message sent successfully.",
                         flush=True
                     )
 
@@ -449,19 +653,25 @@ def send_discord(
                     )
 
                 last_error = (
-                    f"Discord returned "
-                    f"HTTP {status}"
+                    f"HTTP {status}: "
+                    f"{response_body}"
                 )
 
         except urllib.error.HTTPError as error:
+
+            status = error.code
 
             body = error.read().decode(
                 "utf-8",
                 errors="replace"
             )
 
+            body = _safe_error_body(
+                body
+            )
+
             last_error = (
-                f"HTTP {error.code}: {body}"
+                f"HTTP {status}: {body}"
             )
 
             print(
@@ -474,57 +684,21 @@ def send_discord(
             # RATE LIMIT
             # ------------------------------------------------
 
-            if error.code == 429:
+            if status == 429:
 
-                retry_after = None
-
-                try:
-                    retry_header = (
-                        error.headers.get(
-                            "Retry-After"
-                        )
+                retry_seconds = (
+                    _parse_retry_after(
+                        body,
+                        error.headers,
+                        fallback=30.0
                     )
+                )
 
-                    if retry_header:
-                        retry_after = float(
-                            retry_header
-                        )
-
-                except Exception:
-                    retry_after = None
-
-                # Discord may provide retry_after
-                # inside the JSON response.
-                if retry_after is None:
-
-                    try:
-                        response_json = json.loads(
-                            body
-                        )
-
-                        retry_after = float(
-                            response_json.get(
-                                "retry_after",
-                                0
-                            )
-                        )
-
-                    except Exception:
-                        retry_after = None
-
-                if retry_after is None:
-                    retry_after = (
-                        DISCORD_BASE_BACKOFF
-                        * (2 ** (attempt - 1))
-                    )
-
-                # Safety cap.
-                retry_after = max(
-                    1.0,
-                    min(
-                        retry_after,
-                        60.0
-                    )
+                # Add a small safety buffer so we don't
+                # immediately hit the same Cloudflare limit.
+                wait_seconds = min(
+                    retry_seconds + 2.0,
+                    float(DISCORD_MAX_BACKOFF)
                 )
 
                 print(
@@ -533,68 +707,101 @@ def send_discord(
                 )
 
                 print(
-                    f"Waiting {retry_after:.1f} "
-                    f"seconds before retry...",
+                    f"Discord requested "
+                    f"{retry_seconds:.1f}s.",
                     flush=True
                 )
 
-                if attempt < DISCORD_MAX_RETRIES:
+                print(
+                    f"Waiting {wait_seconds:.1f}s "
+                    f"before retry...",
+                    flush=True
+                )
 
-                    time.sleep(
-                        retry_after
-                    )
+                # If this was the final attempt, don't
+                # sleep pointlessly.
+                if attempt >= DISCORD_MAX_ATTEMPTS:
 
-                    continue
+                    break
+
+                time.sleep(
+                    wait_seconds
+                )
+
+                continue
 
             # ------------------------------------------------
-            # OTHER RETRYABLE ERRORS
+            # TRANSIENT SERVER ERRORS
             # ------------------------------------------------
 
-            if error.code in (
+            if status in (
                 500,
                 502,
                 503,
                 504
             ):
 
+                if attempt >= DISCORD_MAX_ATTEMPTS:
+                    break
+
                 backoff = min(
-                    DISCORD_BASE_BACKOFF
-                    * (2 ** (attempt - 1)),
-                    60
+                    2 ** (attempt - 1) * 5,
+                    DISCORD_MAX_BACKOFF
                 )
 
                 print(
-                    f"Retryable Discord error. "
-                    f"Waiting {backoff:.1f}s...",
+                    f"Discord server error. "
+                    f"Waiting {backoff}s...",
                     flush=True
                 )
 
-                if attempt < DISCORD_MAX_RETRIES:
+                time.sleep(
+                    backoff
+                )
 
-                    time.sleep(
-                        backoff
-                    )
-
-                    continue
+                continue
 
             # ------------------------------------------------
-            # AUTH / PERMISSION ERRORS
+            # AUTH / PERMISSION / BAD REQUEST
+            #
+            # Retrying these won't fix the problem.
             # ------------------------------------------------
 
-            if error.code in (
+            if status in (
+                400,
                 401,
                 403,
                 404
             ):
 
                 print(
-                    "Discord rejected the request. "
-                    "Check the bot token, channel ID, "
-                    "bot permissions, and channel access.",
+                    "Discord returned a non-retryable "
+                    f"HTTP {status}.",
                     flush=True
                 )
 
-            break
+                break
+
+            # ------------------------------------------------
+            # Other HTTP errors.
+            # ------------------------------------------------
+
+            if attempt >= DISCORD_MAX_ATTEMPTS:
+                break
+
+            backoff = min(
+                2 ** (attempt - 1) * 5,
+                DISCORD_MAX_BACKOFF
+            )
+
+            print(
+                f"Waiting {backoff}s before retry...",
+                flush=True
+            )
+
+            time.sleep(
+                backoff
+            )
 
         except urllib.error.URLError as error:
 
@@ -603,65 +810,60 @@ def send_discord(
             )
 
             print(
-                "Discord error:",
+                "Discord network error:",
                 last_error,
                 flush=True
             )
 
-            if attempt < DISCORD_MAX_RETRIES:
+            if attempt >= DISCORD_MAX_ATTEMPTS:
+                break
 
-                backoff = min(
-                    DISCORD_BASE_BACKOFF
-                    * (2 ** (attempt - 1)),
-                    60
-                )
+            backoff = min(
+                2 ** (attempt - 1) * 5,
+                DISCORD_MAX_BACKOFF
+            )
 
-                print(
-                    f"Network retry in "
-                    f"{backoff:.1f}s...",
-                    flush=True
-                )
+            print(
+                f"Waiting {backoff}s before "
+                "network retry...",
+                flush=True
+            )
 
-                time.sleep(
-                    backoff
-                )
-
-                continue
-
-            break
+            time.sleep(
+                backoff
+            )
 
         except Exception as error:
 
             last_error = (
-                f"{type(error).__name__}: "
-                f"{error}"
+                f"{type(error).__name__}: {error}"
             )
 
             print(
-                "Discord error:",
+                "Discord unexpected error:",
                 last_error,
                 flush=True
             )
 
-            if attempt < DISCORD_MAX_RETRIES:
+            if attempt >= DISCORD_MAX_ATTEMPTS:
+                break
 
-                backoff = min(
-                    DISCORD_BASE_BACKOFF
-                    * (2 ** (attempt - 1)),
-                    60
-                )
+            backoff = min(
+                2 ** (attempt - 1) * 5,
+                DISCORD_MAX_BACKOFF
+            )
 
-                time.sleep(
-                    backoff
-                )
+            time.sleep(
+                backoff
+            )
 
-                continue
-
-            break
+    # --------------------------------------------------------
+    # All attempts failed.
+    # --------------------------------------------------------
 
     print(
-        "Discord send failed after "
-        f"{DISCORD_MAX_RETRIES} attempts.",
+        "Discord delivery failed after "
+        f"{DISCORD_MAX_ATTEMPTS} attempts.",
         flush=True
     )
 
@@ -681,6 +883,7 @@ def analyze_btc():
     candles = get_btc_candles()
 
     if len(candles) < 60:
+
         raise RuntimeError(
             "Not enough Coinbase candles."
         )
@@ -689,6 +892,7 @@ def analyze_btc():
     closed = candles[:-1]
 
     if len(closed) < 50:
+
         raise RuntimeError(
             "Not enough closed candles."
         )
@@ -724,6 +928,7 @@ def analyze_btc():
     ]
 
     price = closes[-1]
+
     current_open = opens[-1]
     current_high = highs[-1]
     current_low = lows[-1]
@@ -819,7 +1024,10 @@ def analyze_btc():
 
     reasons = []
 
+    # --------------------------------------------------------
     # EMA
+    # --------------------------------------------------------
+
     if ema9 > ema21:
 
         bullish_score += 2
@@ -836,7 +1044,10 @@ def analyze_btc():
             "🔴 EMA9 < EMA21"
         )
 
+    # --------------------------------------------------------
     # EMA40
+    # --------------------------------------------------------
+
     if price > ema40:
 
         bullish_score += 2
@@ -853,14 +1064,16 @@ def analyze_btc():
             "🔴 BTC below EMA40"
         )
 
+    # --------------------------------------------------------
     # RSI
+    # --------------------------------------------------------
+
     if current_rsi >= 55:
 
         bullish_score += 2
 
         reasons.append(
-            f"🟢 RSI bullish "
-            f"({current_rsi:.1f})"
+            f"🟢 RSI bullish ({current_rsi:.1f})"
         )
 
     elif current_rsi <= 45:
@@ -868,8 +1081,7 @@ def analyze_btc():
         bearish_score += 2
 
         reasons.append(
-            f"🔴 RSI bearish "
-            f"({current_rsi:.1f})"
+            f"🔴 RSI bearish ({current_rsi:.1f})"
         )
 
     elif current_rsi > 50:
@@ -890,7 +1102,10 @@ def analyze_btc():
             f"({current_rsi:.1f})"
         )
 
+    # --------------------------------------------------------
     # MACD
+    # --------------------------------------------------------
+
     if macd_value > macd_signal:
 
         bullish_score += 2
@@ -907,7 +1122,10 @@ def analyze_btc():
             "🔴 MACD bearish"
         )
 
-    # Volume
+    # --------------------------------------------------------
+    # VOLUME
+    # --------------------------------------------------------
+
     if relative_volume >= 1.15:
 
         if bullish_candle:
@@ -942,7 +1160,10 @@ def analyze_btc():
             f"({relative_volume:.2f}x)"
         )
 
-    # Candle
+    # --------------------------------------------------------
+    # CANDLE CLOSE
+    # --------------------------------------------------------
+
     if (
         bullish_candle
         and close_position >= 0.70
@@ -965,7 +1186,10 @@ def analyze_btc():
             "🔴 Strong bearish candle close"
         )
 
-    # Momentum
+    # --------------------------------------------------------
+    # MOMENTUM
+    # --------------------------------------------------------
+
     if bullish_momentum:
 
         bullish_score += 1
@@ -982,7 +1206,10 @@ def analyze_btc():
             "🔴 Short-term momentum DOWN"
         )
 
-    # Breakout
+    # --------------------------------------------------------
+    # BREAKOUT
+    # --------------------------------------------------------
+
     if breakout_up:
 
         bullish_score += 3
@@ -999,8 +1226,13 @@ def analyze_btc():
             "📉 Downside range breakout"
         )
 
+    # --------------------------------------------------------
+    # SIGNAL
+    # --------------------------------------------------------
+
     score_gap = abs(
-        bullish_score - bearish_score
+        bullish_score
+        - bearish_score
     )
 
     strongest_score = max(
@@ -1008,7 +1240,6 @@ def analyze_btc():
         bearish_score
     )
 
-    # Signal
     if (
         bullish_score >= 8
         and bullish_score > bearish_score
@@ -1030,7 +1261,10 @@ def analyze_btc():
         signal = "⏸️ NO TRADE"
         direction = "NONE"
 
-    # Confidence
+    # --------------------------------------------------------
+    # CONFIDENCE
+    # --------------------------------------------------------
+
     if direction in (
         "UP",
         "DOWN"
@@ -1065,7 +1299,10 @@ def analyze_btc():
         else 1
     )
 
-    # Average range
+    # --------------------------------------------------------
+    # TRADE LEVELS
+    # --------------------------------------------------------
+
     recent_ranges = [
         highs[i] - lows[i]
         for i in range(
@@ -1085,9 +1322,9 @@ def analyze_btc():
     )
 
     if average_range <= 0:
+
         average_range = candle_range
 
-    # Trade levels
     if direction == "UP":
 
         entry = price
@@ -1121,6 +1358,10 @@ def analyze_btc():
         entry = price
         take_profit = price
         stop_loss = price
+
+    # --------------------------------------------------------
+    # CANDLE TIME
+    # --------------------------------------------------------
 
     candle_timestamp = candle_times[-1]
 
@@ -1157,7 +1398,7 @@ def analyze_btc():
 
 
 # ============================================================
-# DISCORD EMBED
+# BUILD DISCORD EMBED
 # ============================================================
 
 def build_embed(result):
@@ -1295,8 +1536,8 @@ def build_embed(result):
 
         "footer": {
             "text": (
-                "PKLA Signal Hub • BTC • RSI • "
-                "MACD • EMA • Volume"
+                "PKLA Signal Hub • BTC • "
+                "RSI • MACD • EMA • Volume"
             )
         },
 
@@ -1312,20 +1553,18 @@ def build_embed(result):
 
 def send_signal(result):
 
-    # SEND_NO_TRADE defaults to 1 now,
-    # so Discord receives every 15-minute result.
-
     if (
         result["direction"] == "NONE"
         and not SEND_NO_TRADE
     ):
 
         print(
-            "NO TRADE signal - Discord message skipped.",
+            "NO TRADE signal - Discord "
+            "message skipped.",
             flush=True
         )
 
-        return
+        return False
 
     print(
         "Sending 15-minute result to Discord...",
@@ -1344,18 +1583,22 @@ def send_signal(result):
             flush=True
         )
 
-    else:
+        return True
+
+    print(
+        "Signal was NOT sent to Discord.",
+        flush=True
+    )
+
+    if error_detail:
 
         print(
-            "Signal was NOT sent to Discord.",
-            flush=True
-        )
-
-        print(
-            "Discord final error:",
+            "Final Discord error:",
             error_detail,
             flush=True
         )
+
+    return False
 
 
 # ============================================================
@@ -1420,6 +1663,12 @@ def run_radar():
     )
 
     print(
+        f"Discord max attempts: "
+        f"{DISCORD_MAX_ATTEMPTS}",
+        flush=True
+    )
+
+    print(
         "==========================================",
         flush=True
     )
@@ -1454,7 +1703,8 @@ def run_radar():
         try:
 
             print(
-                "Checking Coinbase for new closed candle...",
+                "Checking Coinbase for new "
+                "closed candle...",
                 flush=True
             )
 
@@ -1473,20 +1723,21 @@ def run_radar():
 
                 continue
 
-            # Coinbase returns newest first after
-            # sorting, so candles[-2] is the latest
-            # completed candle and candles[-1] is
-            # the currently forming candle.
-
+            # Coinbase returns the newest candle,
+            # which may still be forming.
+            #
+            # candles[-2] = newest CLOSED candle.
             latest_closed = candles[-2]
 
             candle_timestamp = int(
                 latest_closed[0]
             )
 
-            candle_datetime = datetime.fromtimestamp(
-                candle_timestamp,
-                tz=timezone.utc
+            candle_datetime = (
+                datetime.fromtimestamp(
+                    candle_timestamp,
+                    tz=timezone.utc
+                )
             )
 
             print(
@@ -1494,6 +1745,10 @@ def run_radar():
                 candle_datetime.isoformat(),
                 flush=True
             )
+
+            # ------------------------------------------------
+            # Already processed this exact 15M candle.
+            # ------------------------------------------------
 
             if (
                 last_processed_candle
@@ -1510,6 +1765,10 @@ def run_radar():
                 )
 
                 continue
+
+            # ------------------------------------------------
+            # NEW 15-MINUTE CANDLE
+            # ------------------------------------------------
 
             print(
                 "New closed 15M candle detected!",
@@ -1560,6 +1819,14 @@ def run_radar():
                 ].isoformat(),
                 flush=True
             )
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            #
+            # Mark the candle as processed after attempting
+            # delivery. This prevents the same signal from
+            # being sent repeatedly every 10 seconds.
+            # ------------------------------------------------
 
             send_signal(
                 result
