@@ -1,4 +1,3 @@
-```python
 import os
 import time
 import threading
@@ -7,34 +6,22 @@ from datetime import datetime, timezone
 import requests
 from flask import Flask, jsonify
 
-# ============================================================
-# CONFIG
-# ============================================================
-
 PORT = int(os.environ.get("PORT", "10000"))
 
 COINBASE_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
-GRANULARITY = 900  # 15 minutes
+GRANULARITY = 900
 CHECK_INTERVAL = 10
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-
-SEND_EVERY_15M = True
 
 MAX_DISCORD_ATTEMPTS = 5
 DEFAULT_RETRY_SECONDS = 30
 MAX_RETRY_SECONDS = 300
 
-# /test has NO local cooldown.
-# Each request starts one background test.
 last_processed_candle = None
 
 app = Flask(__name__)
 
-
-# ============================================================
-# DISPLAY
-# ============================================================
 
 def print_banner():
     print()
@@ -60,10 +47,6 @@ def print_banner():
 
     print()
 
-
-# ============================================================
-# COINBASE
-# ============================================================
 
 def get_candles():
     print("Requesting BTC candles from Coinbase...")
@@ -110,10 +93,6 @@ def get_latest_closed_candle(candles):
 
     return max(closed, key=lambda x: int(x[0]))
 
-
-# ============================================================
-# ANALYSIS
-# ============================================================
 
 def analyze_btc(candles, latest_candle):
     if len(candles) < 30:
@@ -181,7 +160,8 @@ def analyze_btc(candles, latest_candle):
                 55,
                 50 + int(
                     (bullish_score - bearish_score)
-                    / max(total, 1) * 50
+                    / max(total, 1)
+                    * 50
                 )
             )
         )
@@ -194,7 +174,8 @@ def analyze_btc(candles, latest_candle):
                 55,
                 50 + int(
                     (bearish_score - bullish_score)
-                    / max(total, 1) * 50
+                    / max(total, 1)
+                    * 50
                 )
             )
         )
@@ -213,16 +194,17 @@ def analyze_btc(candles, latest_candle):
     }
 
 
-# ============================================================
-# DISCORD MESSAGE
-# ============================================================
-
 def build_discord_message(result, test=False):
     if test:
+        current_time = datetime.now(
+            timezone.utc
+        ).strftime("%Y-%m-%d %H:%M:%S UTC")
+
         return (
             "🧪 **PKLA BTC DISCORD RADAR TEST**\n\n"
-            "Discord webhook connection test.\n"
-            f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+            "✅ Discord webhook connection is working.\n"
+            f"Time: {current_time}\n"
+            "The radar is successfully connected to Discord."
         )
 
     candle_time = datetime.fromtimestamp(
@@ -242,13 +224,9 @@ def build_discord_message(result, test=False):
     )
 
 
-# ============================================================
-# DISCORD SEND
-# ============================================================
-
-def send_to_discord(message, label="Discord"):
+def send_to_discord(message):
     if not DISCORD_WEBHOOK_URL:
-        print(f"{label}: webhook is missing.")
+        print("ERROR: Discord webhook is missing.")
         return False
 
     payload = {
@@ -262,7 +240,7 @@ def send_to_discord(message, label="Discord"):
 
     for attempt in range(1, MAX_DISCORD_ATTEMPTS + 1):
         print(
-            f"{label} attempt "
+            f"Discord webhook attempt "
             f"{attempt}/{MAX_DISCORD_ATTEMPTS}..."
         )
 
@@ -278,7 +256,7 @@ def send_to_discord(message, label="Discord"):
             )
 
             if response.status_code in (200, 204):
-                print(f"✅ {label} sent successfully.")
+                print("SUCCESS: Discord message sent.")
                 return True
 
             if response.status_code == 429:
@@ -301,68 +279,55 @@ def send_to_discord(message, label="Discord"):
                 retry_after = max(1, retry_after)
 
                 print(
-                    f"{label}: Discord rate limited request. "
-                    f"Waiting {retry_after:.1f}s..."
+                    f"Discord rate limited the webhook. "
+                    f"Waiting {retry_after:.1f}s."
                 )
 
                 if attempt < MAX_DISCORD_ATTEMPTS:
                     time.sleep(retry_after)
-
                     retry_seconds = min(
                         retry_seconds * 2,
                         MAX_RETRY_SECONDS
                     )
-
                     continue
 
-                print(f"{label}: rate limit persisted.")
+                print("Discord rate limit persisted.")
                 return False
 
             if 500 <= response.status_code <= 599:
                 print(
-                    f"{label}: Discord server error "
+                    f"Discord server error "
                     f"{response.status_code}."
                 )
 
                 if attempt < MAX_DISCORD_ATTEMPTS:
-                    print(
-                        f"Waiting {retry_seconds}s before retry..."
-                    )
-
                     time.sleep(retry_seconds)
-
                     retry_seconds = min(
                         retry_seconds * 2,
                         MAX_RETRY_SECONDS
                     )
-
                     continue
 
                 return False
 
             print(
-                f"{label}: Discord rejected message: "
+                f"Discord rejected message: "
                 f"HTTP {response.status_code}"
             )
+
             print(response.text[:1000])
 
             return False
 
         except requests.RequestException as exc:
-            print(f"{label}: connection error: {exc}")
+            print(f"Discord connection error: {exc}")
 
             if attempt < MAX_DISCORD_ATTEMPTS:
-                print(
-                    f"Waiting {retry_seconds}s before retry..."
-                )
-
                 time.sleep(retry_seconds)
-
                 retry_seconds = min(
                     retry_seconds * 2,
                     MAX_RETRY_SECONDS
                 )
-
                 continue
 
             return False
@@ -370,46 +335,13 @@ def send_to_discord(message, label="Discord"):
     return False
 
 
-# ============================================================
-# BACKGROUND TEST
-# ============================================================
-
-def run_test_in_background():
-    print("🧪 Background Discord test started.")
-
-    message = build_discord_message(
-        {
-            "candle_time": int(time.time()),
-            "price": 0,
-            "signal": "TEST",
-            "confidence": 0,
-            "bullish_score": 0,
-            "bearish_score": 0
-        },
-        test=True
-    )
-
-    success = send_to_discord(
-        message,
-        label="Discord TEST"
-    )
-
-    if success:
-        print("✅ Background Discord test completed successfully.")
-    else:
-        print("❌ Background Discord test FAILED.")
-
-
-# ============================================================
-# PROCESS CANDLE
-# ============================================================
-
 def process_latest_candle():
     global last_processed_candle
 
     print("Checking Coinbase for new closed candle...")
 
     candles = get_candles()
+
     latest = get_latest_closed_candle(candles)
 
     if latest is None:
@@ -429,10 +361,8 @@ def process_latest_candle():
         print("No new closed 15M candle yet.")
         return
 
-    print("New closed 15M candle detected!")
+    print("New closed 15M candle detected.")
     print("Analyzing BTC...")
-
-    candles = get_candles()
 
     result = analyze_btc(candles, latest)
 
@@ -441,32 +371,22 @@ def process_latest_candle():
     print(f"Confidence: {result['confidence']}%")
     print(f"Bullish score: {result['bullish_score']}")
     print(f"Bearish score: {result['bearish_score']}")
-    print(f"Candle analyzed: {candle_iso}")
 
     last_processed_candle = candle_timestamp
 
     if result["signal"] == "⏸️ NO TRADE":
-        print("NO TRADE signal - Discord message skipped.")
-        print("Candle processing complete.")
+        print("NO TRADE - Discord message skipped.")
         return
-
-    print("Sending 15-minute result to Discord...")
 
     message = build_discord_message(result)
 
     success = send_to_discord(message)
 
     if success:
-        print("15-minute Discord signal sent successfully.")
+        print("15-minute Discord signal sent.")
     else:
         print("Signal was NOT sent to Discord.")
 
-    print("Candle processing complete.")
-
-
-# ============================================================
-# RADAR LOOP
-# ============================================================
 
 def radar_loop():
     print("Radar thread started.")
@@ -474,15 +394,12 @@ def radar_loop():
     while True:
         try:
             process_latest_candle()
+
         except Exception as exc:
             print(f"Radar error: {exc}")
 
         time.sleep(CHECK_INTERVAL)
 
-
-# ============================================================
-# FLASK
-# ============================================================
 
 @app.route("/")
 def home():
@@ -493,46 +410,46 @@ def home():
         "timeframe": "15M",
         "send_every_15m": True,
         "discord_webhook_configured": bool(DISCORD_WEBHOOK_URL),
-        "test_cooldown": False,
-        "test_endpoint": "/test"
+        "test_endpoint": "/test",
+        "test_cooldown": False
     })
 
 
-@app.route("/test")
+@app.route("/test", methods=["GET"])
 def test_discord():
-    """
-    IMPORTANT:
-    This endpoint NEVER waits for Discord.
-
-    It starts the Discord test in a background thread and
-    immediately returns a JSON response to the browser.
-    """
-
-    print("🧪 Manual /test request received.")
+    print("Manual Discord test requested.")
 
     if not DISCORD_WEBHOOK_URL:
         return jsonify({
             "status": "error",
-            "message": "DISCORD_WEBHOOK_URL is missing from Render environment variables."
+            "message": "DISCORD_WEBHOOK_URL is missing."
         }), 500
 
-    test_thread = threading.Thread(
-        target=run_test_in_background,
-        daemon=True
+    message = build_discord_message(
+        {
+            "candle_time": int(time.time()),
+            "price": 0,
+            "signal": "TEST",
+            "confidence": 0,
+            "bullish_score": 0,
+            "bearish_score": 0
+        },
+        test=True
     )
 
-    test_thread.start()
+    success = send_to_discord(message)
+
+    if success:
+        return jsonify({
+            "status": "success",
+            "message": "Test message sent to Discord."
+        }), 200
 
     return jsonify({
-        "status": "test_started",
-        "message": "Discord test started in background.",
-        "check": "Watch the Render logs and Discord channel."
-    }), 200
+        "status": "error",
+        "message": "Discord webhook delivery failed. Check Render logs."
+    }), 502
 
-
-# ============================================================
-# START
-# ============================================================
 
 if __name__ == "__main__":
     print("Starting PKLA BTC Discord Radar...")
@@ -553,4 +470,3 @@ if __name__ == "__main__":
         debug=False,
         threaded=True
     )
-```
