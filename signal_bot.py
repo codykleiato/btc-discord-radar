@@ -11,10 +11,9 @@ app = Flask(__name__)
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
-SYMBOL = os.getenv("SYMBOL", "BTCUSDT").upper()
+SYMBOL = "BTC-USD"
 INTERVAL = "15m"
 CANDLE_LIMIT = 120
-RADAR_INTERVAL_SECONDS = 900  # 15 minutes
 SEND_NO_TRADE = os.getenv("SEND_NO_TRADE", "true").lower() == "true"
 
 last_radar_candle_time = None
@@ -57,8 +56,8 @@ def rsi(values, length=14):
     if average_loss == 0:
         return 100.0
 
-    relative_strength = average_gain / average_loss
-    return 100 - (100 / (1 + relative_strength))
+    rs = average_gain / average_loss
+    return 100 - (100 / (1 + rs))
 
 
 def macd(values, fast_length=12, slow_length=26, signal_length=9):
@@ -86,31 +85,44 @@ def macd(values, fast_length=12, slow_length=26, signal_length=9):
 
 
 def get_btc_candles():
-    url = "https://api.binance.com/api/v3/klines"
+    end_time = int(time.time())
+    start_time = end_time - (CANDLE_LIMIT * 15 * 60)
+
+    url = (
+        "https://api.coinbase.com/api/v3/brokerage/market/"
+        "products/BTC-USD/candles"
+    )
+
     params = {
-        "symbol": SYMBOL,
-        "interval": INTERVAL,
-        "limit": CANDLE_LIMIT,
+        "start": str(start_time),
+        "end": str(end_time),
+        "granularity": "FIFTEEN_MINUTE",
     }
 
     response = requests.get(url, params=params, timeout=20)
     response.raise_for_status()
-    data = response.json()
+
+    payload = response.json()
+    raw_candles = payload.get("candles", [])
+
+    if not raw_candles:
+        raise ValueError("Coinbase returned no BTC-USD candles.")
 
     candles = []
-    for candle in data:
+
+    for candle in raw_candles:
         candles.append(
             {
-                "open_time": int(candle[0]),
-                "open": float(candle[1]),
-                "high": float(candle[2]),
-                "low": float(candle[3]),
-                "close": float(candle[4]),
-                "volume": float(candle[5]),
+                "open_time": int(candle["start"]) * 1000,
+                "open": float(candle["open"]),
+                "high": float(candle["high"]),
+                "low": float(candle["low"]),
+                "close": float(candle["close"]),
+                "volume": float(candle["volume"]),
             }
         )
 
-    return candles
+    return sorted(candles, key=lambda item: item["open_time"])
 
 
 def build_radar_embed(candles):
@@ -129,7 +141,7 @@ def build_radar_embed(candles):
     ema21 = ema(closes[-21:], 21)
     ema40 = ema(closes[-40:], 40)
 
-    macd_line, macd_signal, macd_histogram = macd(closes, 12, 26, 9)
+    macd_line, macd_signal, macd_histogram = macd(closes)
 
     average_volume = sum(volumes[-21:-1]) / 20
     volume_ratio = latest["volume"] / average_volume if average_volume else 1
@@ -152,10 +164,10 @@ def build_radar_embed(candles):
         bearish += 1
         analysis.append("🔴 BTC below EMA40")
 
-    if current_rsi >= 55 and current_rsi < 75:
+    if 55 <= current_rsi < 75:
         bullish += 1
         analysis.append(f"🟢 RSI bullish ({current_rsi:.1f})")
-    elif current_rsi <= 45 and current_rsi > 25:
+    elif 25 < current_rsi <= 45:
         bearish += 1
         analysis.append(f"🔴 RSI bearish ({current_rsi:.1f})")
     elif current_rsi >= 75:
@@ -218,12 +230,13 @@ def build_radar_embed(candles):
         stop_loss = current_price
 
     candle_time = datetime.fromtimestamp(
-        latest["open_time"] / 1000, tz=timezone.utc
+        latest["open_time"] / 1000,
+        tz=timezone.utc,
     ).strftime("%Y-%m-%d %I:%M %p UTC")
 
     description = (
         "**PKLA BTC 15-Minute Market Radar**\n"
-        "Automated technical analysis\n\n"
+        "Coinbase technical analysis\n\n"
         "₿ **BTC PRICE**\n"
         f"**{round_price(current_price)}**\n\n"
         "📊 **SIGNAL**\n"
@@ -255,7 +268,9 @@ def build_radar_embed(candles):
         "title": title,
         "description": description,
         "color": color,
-        "footer": {"text": f"{SYMBOL} • Confirmed 15-minute candle • {candle_time}"},
+        "footer": {
+            "text": f"{SYMBOL} • Confirmed 15-minute candle • {candle_time}"
+        },
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -264,7 +279,9 @@ def build_radar_embed(candles):
 
 def send_discord_embed(embed):
     if not DISCORD_WEBHOOK_URL:
-        raise ValueError("DISCORD_WEBHOOK_URL is missing in Render Environment.")
+        raise ValueError(
+            "DISCORD_WEBHOOK_URL is missing in Render Environment."
+        )
 
     response = requests.post(
         DISCORD_WEBHOOK_URL,
@@ -294,7 +311,10 @@ def radar_loop():
                 last_radar_candle_time = candle_time
                 last_radar_sent_at = datetime.now(timezone.utc).isoformat()
                 last_radar_error = None
-                print(f"Radar sent: {signal} for candle {candle_time}", flush=True)
+                print(
+                    f"Radar sent: {signal} for candle {candle_time}",
+                    flush=True,
+                )
 
         except Exception as error:
             last_radar_error = str(error)
@@ -335,7 +355,9 @@ def webhook():
     ticker = str(payload.get("ticker", SYMBOL))
     price = str(payload.get("price", "N/A"))
     timeframe = str(payload.get("timeframe", "N/A"))
-    event_time = str(payload.get("time", datetime.now(timezone.utc).isoformat()))
+    event_time = str(
+        payload.get("time", datetime.now(timezone.utc).isoformat())
+    )
 
     is_buy = any(word in signal for word in ["BUY", "UP", "LONG"])
     color = 0x2ECC71 if is_buy else 0xE74C3C
@@ -348,7 +370,7 @@ def webhook():
             f"**Time:** {event_time}"
         ),
         "color": color,
-        "footer": {"text": "TradingView webhook signal"},
+        "footer": {"text": "Webhook signal"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
