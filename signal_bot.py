@@ -7,32 +7,49 @@ import threading
 from datetime import datetime, timezone
 from flask import Flask
 
+
 # ============================================================
 # PKLA BTC DISCORD RADAR
 # Coinbase BTC-USD / 15M
-# Discord delivery uses a BOT REST API, NOT a webhook.
 #
-# Sends ONE Discord message for EVERY newly closed 15M candle.
-# Includes BET UP, BET DOWN, and NO TRADE.
+# Sends ONE Discord message for EVERY closed 15-minute candle.
+# Includes:
+#   ⬆️ BET UP
+#   ⬇️ BET DOWN
+#   ⏸️ NO TRADE
+#
+# Discord delivery uses BOT REST API.
 # ============================================================
 
-DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
-DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "").strip()
 
-# Kept for compatibility with existing Render settings.
-# NO TRADE is now ALWAYS sent.
+DISCORD_BOT_TOKEN = os.environ.get(
+    "DISCORD_BOT_TOKEN", ""
+).strip()
+
+DISCORD_CHANNEL_ID = os.environ.get(
+    "DISCORD_CHANNEL_ID", ""
+).strip()
+
+# ALWAYS send the result, including NO TRADE.
 SEND_NO_TRADE = True
 
-# How often Render checks Coinbase for a newly closed candle.
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "10"))
+# How often the bot checks Coinbase for a new closed candle.
+# This does NOT change the trading timeframe.
+# The timeframe remains 15 minutes.
+CHECK_INTERVAL = int(
+    os.environ.get("CHECK_INTERVAL", "10")
+)
 
 SYMBOL = "BTC-USD"
-GRANULARITY = 900  # 900 seconds = 15 minutes
+
+# Coinbase 900 seconds = 15 minutes.
+GRANULARITY = 900
 
 COINBASE_URL = (
     "https://api.exchange.coinbase.com/products/"
     f"{SYMBOL}/candles?granularity={GRANULARITY}"
 )
+
 
 app = Flask(__name__)
 
@@ -48,7 +65,7 @@ def home():
         "service": "btc-discord-radar",
         "discord": "bot_api",
         "timeframe": "15M",
-        "send_every_candle": True
+        "send_every_15m": True
     }
 
 
@@ -64,7 +81,9 @@ def test_discord():
         "footer": {
             "text": "PKLA Signal Hub • Connection Test"
         },
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": datetime.now(
+            timezone.utc
+        ).isoformat()
     }
 
     success, error_detail = send_discord(
@@ -86,7 +105,9 @@ def test_discord():
 
 
 def start_web_server():
-    port = int(os.environ.get("PORT", "10000"))
+    port = int(
+        os.environ.get("PORT", "10000")
+    )
 
     print(
         f"Starting web server on port {port}...",
@@ -127,7 +148,9 @@ def get_btc_candles():
         flush=True
     )
 
-    candles = get_json(COINBASE_URL)
+    candles = get_json(
+        COINBASE_URL
+    )
 
     if not candles:
         raise RuntimeError(
@@ -164,7 +187,8 @@ def ema(values, period):
 
     for price in values[1:]:
         result.append(
-            (price - result[-1]) * multiplier
+            (price - result[-1])
+            * multiplier
             + result[-1]
         )
 
@@ -179,7 +203,10 @@ def rsi(values, period=14):
     losses = []
 
     for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
+        change = (
+            values[i]
+            - values[i - 1]
+        )
 
         gains.append(
             max(change, 0.0)
@@ -189,42 +216,69 @@ def rsi(values, period=14):
             max(-change, 0.0)
         )
 
-    avg_gain = sum(
-        gains[:period]
-    ) / period
+    avg_gain = (
+        sum(gains[:period])
+        / period
+    )
 
-    avg_loss = sum(
-        losses[:period]
-    ) / period
+    avg_loss = (
+        sum(losses[:period])
+        / period
+    )
 
-    for i in range(period, len(gains)):
+    for i in range(
+        period,
+        len(gains)
+    ):
         avg_gain = (
-            (avg_gain * (period - 1))
+            (
+                avg_gain
+                * (period - 1)
+            )
             + gains[i]
         ) / period
 
         avg_loss = (
-            (avg_loss * (period - 1))
+            (
+                avg_loss
+                * (period - 1)
+            )
             + losses[i]
         ) / period
 
     if avg_loss == 0:
-        return 100.0 if avg_gain else 50.0
+        return (
+            100.0
+            if avg_gain
+            else 50.0
+        )
 
     rs = avg_gain / avg_loss
 
-    return 100.0 - (
-        100.0 / (1.0 + rs)
+    return (
+        100.0
+        - (
+            100.0
+            / (1.0 + rs)
+        )
     )
 
 
 def macd(values):
-    ema12 = ema(values, 12)
-    ema26 = ema(values, 26)
+    ema12 = ema(
+        values,
+        12
+    )
+
+    ema26 = ema(
+        values,
+        26
+    )
 
     macd_line = [
         a - b
-        for a, b in zip(
+        for a, b
+        in zip(
             ema12,
             ema26
         )
@@ -248,7 +302,10 @@ def macd(values):
 # DISCORD BOT REST API
 # ============================================================
 
-def send_discord(embed, return_error=False):
+def send_discord(
+    embed,
+    return_error=False
+):
 
     if not DISCORD_BOT_TOKEN:
         error = (
@@ -287,8 +344,10 @@ def send_discord(embed, return_error=False):
         )
 
     url = (
-        "https://discord.com/api/v10/channels/"
-        f"{DISCORD_CHANNEL_ID}/messages"
+        "https://discord.com/api/v10/"
+        "channels/"
+        f"{DISCORD_CHANNEL_ID}"
+        "/messages"
     )
 
     payload = {
@@ -304,20 +363,18 @@ def send_discord(embed, return_error=False):
         url,
         data=data,
         headers={
-            "Authorization": (
-                f"Bot {DISCORD_BOT_TOKEN}"
-            ),
-            "Content-Type": (
-                "application/json"
-            ),
-            "User-Agent": (
+            "Authorization":
+                f"Bot {DISCORD_BOT_TOKEN}",
+            "Content-Type":
+                "application/json",
+            "User-Agent":
                 "PKLA-BTC-Radar/5.0"
-            )
         },
         method="POST"
     )
 
     try:
+
         with urllib.request.urlopen(
             request,
             timeout=15
@@ -332,6 +389,7 @@ def send_discord(embed, return_error=False):
             )
 
             if 200 <= status < 300:
+
                 return (
                     (True, None)
                     if return_error
@@ -429,7 +487,8 @@ def analyze_btc():
             "Not enough Coinbase candles."
         )
 
-    # Latest candle can still be forming.
+    # The newest Coinbase candle can still
+    # be forming, so exclude it.
     closed = candles[:-1]
 
     if len(closed) < 50:
@@ -564,7 +623,7 @@ def analyze_btc():
 
     reasons = []
 
-    # EMA trend
+    # EMA
     if ema9 > ema21:
 
         bullish_score += 2
@@ -581,7 +640,7 @@ def analyze_btc():
             "🔴 EMA9 < EMA21"
         )
 
-    # EMA40 trend
+    # EMA40
     if price > ema40:
 
         bullish_score += 2
@@ -660,7 +719,7 @@ def analyze_btc():
             bullish_score += 2
 
             reasons.append(
-                f"🟢 Strong bullish volume "
+                "🟢 Strong bullish volume "
                 f"({relative_volume:.2f}x)"
             )
 
@@ -669,7 +728,7 @@ def analyze_btc():
             bearish_score += 2
 
             reasons.append(
-                f"🔴 Strong bearish volume "
+                "🔴 Strong bearish volume "
                 f"({relative_volume:.2f}x)"
             )
 
@@ -687,7 +746,7 @@ def analyze_btc():
             f"({relative_volume:.2f}x)"
         )
 
-    # Candle close
+    # Candle
     if (
         bullish_candle
         and close_position >= 0.70
@@ -745,7 +804,8 @@ def analyze_btc():
         )
 
     score_gap = abs(
-        bullish_score - bearish_score
+        bullish_score
+        - bearish_score
     )
 
     strongest_score = max(
@@ -776,7 +836,10 @@ def analyze_btc():
         direction = "NONE"
 
     # Confidence
-    if direction in ("UP", "DOWN"):
+    if direction in (
+        "UP",
+        "DOWN"
+    ):
 
         confidence = (
             50
@@ -925,12 +988,13 @@ def build_embed(result):
     )
 
     return {
+
         "title": title,
 
         "description": (
             "**PKLA BTC 15-Minute Market Radar**\n"
-            "Automated technical analysis\n\n"
-            "📩 **15-minute candle report**"
+            "Automated technical analysis\n"
+            "📨 Scheduled every closed 15-minute candle"
         ),
 
         "color": color,
@@ -965,7 +1029,7 @@ def build_embed(result):
                 "name": "🕯 HOLD",
                 "value": (
                     f"**{result['hold_candles']} "
-                    f"candle(s)**"
+                    "candle(s)**"
                 ),
                 "inline": True
             },
@@ -1035,7 +1099,7 @@ def build_embed(result):
             },
 
             {
-                "name": "🕒 CANDLE",
+                "name": "🕐 CANDLE",
                 "value": (
                     f"**{result['candle_datetime'].strftime('%Y-%m-%d %H:%M UTC')}**"
                 ),
@@ -1046,16 +1110,14 @@ def build_embed(result):
 
         "footer": {
             "text": (
-                "PKLA Signal Hub • BTC • RSI • "
-                "MACD • EMA • Volume"
+                "PKLA Signal Hub • "
+                "BTC • RSI • MACD • EMA • Volume"
             )
         },
 
-        "timestamp": (
-            datetime.now(
-                timezone.utc
-            ).isoformat()
-        )
+        "timestamp": datetime.now(
+            timezone.utc
+        ).isoformat()
     }
 
 
@@ -1066,16 +1128,19 @@ def build_embed(result):
 def send_signal(result):
 
     # IMPORTANT:
-    # Every closed 15M candle is sent.
-    # NO TRADE is NOT skipped anymore.
-
+    # Never skip NO TRADE.
+    # Every closed 15-minute candle gets sent.
     print(
-        "Sending 15M candle report to Discord Bot API...",
+        "Sending 15-minute result to Discord...",
         flush=True
     )
 
+    embed = build_embed(
+        result
+    )
+
     success = send_discord(
-        build_embed(result)
+        embed
     )
 
     if success:
@@ -1140,12 +1205,12 @@ def run_radar():
     )
 
     print(
-        f"Check interval: {CHECK_INTERVAL}s",
+        "SEND EVERY 15M: ENABLED",
         flush=True
     )
 
     print(
-        "Discord reports: EVERY CLOSED 15M CANDLE",
+        f"Check interval: {CHECK_INTERVAL}s",
         flush=True
     )
 
@@ -1203,9 +1268,10 @@ def run_radar():
 
                 continue
 
-            # Coinbase returns the newest candle last.
-            # The final candle can still be forming.
-            # Therefore candles[-2] is the latest CLOSED candle.
+            # Coinbase returns the newest candle,
+            # which may still be forming.
+            # The candle before it is the latest
+            # CLOSED 15-minute candle.
 
             latest_closed = candles[-2]
 
@@ -1213,9 +1279,11 @@ def run_radar():
                 latest_closed[0]
             )
 
-            candle_datetime = datetime.fromtimestamp(
-                candle_timestamp,
-                tz=timezone.utc
+            candle_datetime = (
+                datetime.fromtimestamp(
+                    candle_timestamp,
+                    tz=timezone.utc
+                )
             )
 
             print(
@@ -1224,6 +1292,7 @@ def run_radar():
                 flush=True
             )
 
+            # Only process each closed candle once.
             if (
                 last_processed_candle
                 == candle_timestamp
@@ -1284,20 +1353,15 @@ def run_radar():
 
             print(
                 "Candle analyzed:",
-                result[
-                    "candle_datetime"
-                ].isoformat(),
+                result["candle_datetime"].isoformat(),
                 flush=True
             )
 
-            # ALWAYS SEND.
-            # Includes NO TRADE.
-
-            send_signal(result)
-
-            # Mark the candle processed only after
-            # the send attempt, preventing duplicate
-            # processing during the same candle.
+            # SEND EVERY CANDLE.
+            # NO TRADE IS NOT SKIPPED.
+            send_signal(
+                result
+            )
 
             last_processed_candle = (
                 candle_timestamp
