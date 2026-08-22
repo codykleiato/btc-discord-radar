@@ -1,437 +1,1042 @@
+import json
+import logging
 import os
+import signal
 import time
-import threading
 from datetime import datetime, timezone
+from pathlib import Path
+from statistics import mean
+from typing import Optional
 
 import requests
-from flask import Flask, jsonify
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# ============================================================
-# PKLA BTC DISCORD RADAR
-# Sends ONE signal after EVERY completed 15-minute BTC candle.
+
+# =============================================================================
+# REDRUM BTC 15M RADAR
 #
-# Required environment variable:
-#   DISCORD_WEBHOOK_URL
+# TWO DISCORD CALLS PER 15-MINUTE MARKET:
+#   1) OPENING CALL  - after 60 seconds
+#   2) MIDPOINT CALL - when 7:30 remains
 #
-# Optional:
-#   COINBASE_PRODUCT=BTC-USD
-#   POLL_SECONDS=10
-#   PORT=10000
-# ============================================================
+# EXCHANGE STATUS:
+#   🟩 UP
+#   🟥 DOWN
+#   🟨 GET OUT - exchange reversed from its opening direction
+#   ⬛ HOLD    - flat/no fresh directional push
+#
+# DATA SOURCES:
+#   Coinbase, Kraken, Bitstamp
+# =============================================================================
+
+
+# ── Settings ─────────────────────────────────────────────────────────────────
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-COINBASE_PRODUCT = os.getenv("COINBASE_PRODUCT", "BTC-USD").strip()
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
-PORT = int(os.getenv("PORT", "10000"))
 
-COINBASE_URL = (
-    "https://api.exchange.coinbase.com/products/"
-    f"{COINBASE_PRODUCT}/candles"
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
+TIMEFRAME_MINUTES = 15
+TIMEFRAME_SECONDS = TIMEFRAME_MINUTES * 60
+
+# Opening scan waits long enough to avoid calling direction on the first tick.
+OPEN_SCAN_DELAY_SECONDS = int(os.getenv("OPEN_SCAN_DELAY_SECONDS", "60"))
+
+# Main call fires when this much time is LEFT in the 15-minute candle.
+MAIN_CALL_REMAINING_MINUTES = float(os.getenv("MAIN_CALL_REMAINING_MINUTES", "7.5"))
+
+
+# Main BET call requires strict 4/4 direction AND these basic quality gates.
+MIN_MAIN_CONFIDENCE = int(os.getenv("MIN_MAIN_CONFIDENCE", "65"))
+MIN_ABS_MOVE_PCT = float(os.getenv("MIN_ABS_MOVE_PCT", "0.015"))
+
+
+STATE_FILE = Path(os.getenv("STATE_FILE", "redrum_btc_radar_state.json"))
+LOG_FILE = Path(os.getenv("LOG_FILE", "redrum_btc_radar.log"))
+
+RUNNING = True
+REQUIRED_NAMES = ("Coinbase", "Kraken", "Bitstamp")
+
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ],
 )
 
-app = Flask(__name__)
-
-last_sent_candle = None
-last_signal = None
+logger = logging.getLogger("redrum-btc-radar")
 
 
-def get_candles(limit=120):
-    """Get 15-minute candles from Coinbase."""
-    params = {"granularity": 900}
-    response = requests.get(
-        COINBASE_URL,
-        params=params,
-        timeout=15,
-        headers={"User-Agent": "PKLA-BTC-Radar/1.0"},
-    )
-    response.raise_for_status()
+# ── HTTP retries ─────────────────────────────────────────────────────────────
 
-    # Coinbase returns: [time, low, high, open, close, volume]
-    raw = response.json()
-
-    candles = []
-    for row in raw:
-        candles.append(
-            {
-                "time": int(row[0]),
-                "low": float(row[1]),
-                "high": float(row[2]),
-                "open": float(row[3]),
-                "close": float(row[4]),
-                "volume": float(row[5]),
-            }
-        )
-
-    candles.sort(key=lambda x: x["time"])
-    return candles[-limit:]
-
-
-def ema(values, period):
-    if not values:
-        return []
-
-    alpha = 2.0 / (period + 1.0)
-    result = [values[0]]
-
-    for value in values[1:]:
-        result.append((value * alpha) + (result[-1] * (1.0 - alpha)))
-
-    return result
-
-
-def rsi(values, period=14):
-    if len(values) < period + 1:
-        return 50.0
-
-    gains = []
-    losses = []
-
-    for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
-        gains.append(max(change, 0.0))
-        losses.append(max(-change, 0.0))
-
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-
-    for i in range(period, len(gains)):
-        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
-        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
-
-    if avg_loss == 0:
-        return 100.0
-
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
-
-
-def atr(candles, period=14):
-    if len(candles) < period + 1:
-        highs = [c["high"] for c in candles]
-        lows = [c["low"] for c in candles]
-        return max(highs) - min(lows)
-
-    trs = []
-    for i, candle in enumerate(candles):
-        if i == 0:
-            tr = candle["high"] - candle["low"]
-        else:
-            previous_close = candles[i - 1]["close"]
-            tr = max(
-                candle["high"] - candle["low"],
-                abs(candle["high"] - previous_close),
-                abs(candle["low"] - previous_close),
-            )
-        trs.append(tr)
-
-    return sum(trs[-period:]) / period
-
-
-def macd(values):
-    ema12 = ema(values, 12)
-    ema26 = ema(values, 26)
-    line = [a - b for a, b in zip(ema12, ema26)]
-    signal = ema(line, 9)
-    return line[-1], signal[-1]
-
-
-def calculate_signal(candles):
-    closes = [c["close"] for c in candles]
-
-    ema9 = ema(closes, 9)[-1]
-    ema21 = ema(closes, 21)[-1]
-    ema40 = ema(closes, 40)[-1]
-
-    current_rsi = rsi(closes, 14)
-    macd_line, macd_signal = macd(closes)
-    current_atr = max(atr(candles, 14), 0.01)
-
-    entry = closes[-1]
-
-    bullish_points = 0
-    bearish_points = 0
-
-    if ema9 > ema21:
-        bullish_points += 1
-    else:
-        bearish_points += 1
-
-    if entry > ema40:
-        bullish_points += 1
-    else:
-        bearish_points += 1
-
-    if current_rsi >= 50:
-        bullish_points += 1
-    else:
-        bearish_points += 1
-
-    if macd_line > macd_signal:
-        bullish_points += 1
-    else:
-        bearish_points += 1
-
-    if entry > ema21:
-        bullish_points += 1
-    else:
-        bearish_points += 1
-
-    if bullish_points > bearish_points:
-        direction = "UP"
-        score_bull = bullish_points
-        score_bear = bearish_points
-        gap = bullish_points - bearish_points
-    elif bearish_points > bullish_points:
-        direction = "DOWN"
-        score_bull = bullish_points
-        score_bear = bearish_points
-        gap = bearish_points - bullish_points
-    else:
-        # Force a direction so every candle produces a trade callout.
-        direction = "UP" if macd_line >= macd_signal else "DOWN"
-        score_bull = bullish_points
-        score_bear = bearish_points
-        gap = 0
-
-    # Confidence is intentionally capped. This is a technical score,
-    # not a guarantee of the next candle's result.
-    confidence = min(100, 60 + (gap * 8))
-
-    if direction == "UP":
-        take_profit = entry + (current_atr * 0.75)
-        stop_loss = entry - (current_atr * 0.55)
-        target = entry + (current_atr * 0.60)
-    else:
-        take_profit = entry - (current_atr * 0.75)
-        stop_loss = entry + (current_atr * 0.55)
-        target = entry - (current_atr * 0.60)
-
-    return {
-        "direction": direction,
-        "entry": entry,
-        "take_profit": take_profit,
-        "stop_loss": stop_loss,
-        "target": target,
-        "target_difference": abs(target - entry),
-        "confidence": confidence,
-        "bullish": score_bull,
-        "bearish": score_bear,
-        "gap": gap,
-        "rsi": current_rsi,
-        "macd": macd_line,
-        "macd_signal": macd_signal,
-        "ema9": ema9,
-        "ema21": ema21,
-        "ema40": ema40,
-        "atr": current_atr,
-    }
-
-
-def fmt_price(value):
-    return f"${value:,.2f}"
-
-
-def candle_window(timestamp):
-    start = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-    end = datetime.fromtimestamp(timestamp + 900, tz=timezone.utc)
-    return start, end
-
-
-def build_discord_payload(candle, signal):
-    start, end = candle_window(candle["time"])
-    color = 0x22C55E if signal["direction"] == "UP" else 0xEF4444
-    emoji = "🟢" if signal["direction"] == "UP" else "🔴"
-
-    hold_candles = 2
-    hold_minutes = hold_candles * 15
-
-    analysis = []
-    if signal["ema9"] > signal["ema21"]:
-        analysis.append("🟢 EMA9 > EMA21")
-    else:
-        analysis.append("🔴 EMA9 < EMA21")
-
-    if candle["close"] > signal["ema40"]:
-        analysis.append("🟢 BTC above EMA40")
-    else:
-        analysis.append("🔴 BTC below EMA40")
-
-    if signal["rsi"] >= 50:
-        analysis.append(f"🟢 RSI bullish ({signal['rsi']:.1f})")
-    else:
-        analysis.append(f"🔴 RSI bearish ({signal['rsi']:.1f})")
-
-    if signal["macd"] > signal["macd_signal"]:
-        analysis.append("🟢 MACD bullish")
-    else:
-        analysis.append("🔴 MACD bearish")
-
-    if signal["direction"] == "UP":
-        above_target = candle["close"] < signal["target"]
-        analysis.append(
-            "🟢 BTC below 15m target"
-            if above_target
-            else "🔴 BTC at/above 15m target"
-        )
-    else:
-        below_target = candle["close"] > signal["target"]
-        analysis.append(
-            "🟢 BTC above 15m target"
-            if below_target
-            else "🔴 BTC at/below 15m target"
-        )
-
-    description = (
-        f"**PKLA BTC 15-Minute Market Radar**\n"
-        f"Coinbase {COINBASE_PRODUCT} technical analysis\n\n"
-        f"💲 **BTC PRICE**\n"
-        f"{fmt_price(candle['close'])}\n\n"
-        f"📊 **SIGNAL**\n"
-        f"**BET {signal['direction']}**\n\n"
-        f"🎯 **CONFIDENCE**\n"
-        f"**{signal['confidence']}%**\n\n"
-        f"🕯️ **HOLD**\n"
-        f"**{hold_candles} candle(s) / up to {hold_minutes} minutes**\n\n"
-        f"📈 **SCORE**\n"
-        f"Bullish: **{signal['bullish']}**\n"
-        f"Bearish: **{signal['bearish']}**\n"
-        f"Gap: **+{signal['gap']}**\n\n"
-        f"📐 **INDICATORS**\n"
-        f"RSI: **{signal['rsi']:.1f}**\n"
-        f"MACD: **{signal['macd']:.2f}**\n"
-        f"Signal: **{signal['macd_signal']:.2f}**\n"
-        f"EMA9: **{fmt_price(signal['ema9'])}**\n"
-        f"EMA21: **{fmt_price(signal['ema21'])}**\n"
-        f"EMA40: **{fmt_price(signal['ema40'])}**\n\n"
-        f"📍 **TRADE LEVELS**\n"
-        f"Entry: **{fmt_price(signal['entry'])}**\n"
-        f"Take Profit: **{fmt_price(signal['take_profit'])}**\n"
-        f"Stop Loss: **{fmt_price(signal['stop_loss'])}**\n\n"
-        f"🎯 **15-MINUTE TARGET**\n"
-        f"Target: **{fmt_price(signal['target'])}**\n"
-        f"Difference: **${signal['target_difference']:,.2f}**\n"
-        f"Window: **{end.strftime('%H:%M UTC')}**\n\n"
-        f"🔬 **ANALYSIS**\n"
-        + "\n".join(analysis)
-        + f"\n\n_Candle closed: {end.strftime('%Y-%m-%d %H:%M UTC')}_"
+def build_session() -> requests.Session:
+    retries = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=3,
+        backoff_factor=1.25,
+        status_forcelist=(408, 429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+        respect_retry_after_header=True,
     )
 
-    return {
-        "username": "PKLA BTC Radar",
-        "embeds": [
-            {
-                "title": f"{emoji} BTC {signal['direction']} SIGNAL",
-                "description": description,
-                "color": color,
-                "footer": {
-                    "text": "PKLA BTC Radar • New signal every completed 15-minute candle"
-                },
-                "timestamp": end.isoformat(),
-            }
-        ],
-    }
-
-
-def send_to_discord(payload):
-    if not DISCORD_WEBHOOK_URL:
-        raise RuntimeError(
-            "DISCORD_WEBHOOK_URL is not set. Add it to your Render environment variables."
-        )
-
-    response = requests.post(
-        DISCORD_WEBHOOK_URL,
-        json=payload,
-        timeout=15,
-    )
-    response.raise_for_status()
-
-
-def process_latest_closed_candle():
-    global last_sent_candle, last_signal
-
-    candles = get_candles(120)
-    if len(candles) < 50:
-        raise RuntimeError("Not enough candle history returned by Coinbase.")
-
-    # Coinbase can include the currently forming candle. The candle immediately
-    # before it is the latest completed 15-minute candle.
-    latest_closed = candles[-2]
-    candle_id = latest_closed["time"]
-
-    if last_sent_candle == candle_id:
-        return False
-
-    # Use candles only through the completed candle for all calculations.
-    closed_history = candles[:-1]
-    signal = calculate_signal(closed_history)
-
-    payload = build_discord_payload(latest_closed, signal)
-    send_to_discord(payload)
-
-    last_sent_candle = candle_id
-    last_signal = signal
-
-    closed_at = datetime.fromtimestamp(
-        candle_id + 900, tz=timezone.utc
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    print(
-        f"[SENT] {closed_at} | BTC {signal['direction']} | "
-        f"entry={fmt_price(signal['entry'])} | "
-        f"confidence={signal['confidence']}%"
-    )
-
-    return True
-
-
-def radar_loop():
-    print("=" * 50)
-    print("       PKLA BTC DISCORD RADAR")
-    print("=" * 50)
-    print(f"Data: Coinbase {COINBASE_PRODUCT}")
-    print("Timeframe: 15M")
-    print("TradingView webhook: NOT REQUIRED")
-    print("Discord: ENABLED")
-    print("=" * 50)
-
-    if DISCORD_WEBHOOK_URL:
-        print("Discord webhook: CONFIGURED")
-    else:
-        print("Discord webhook: MISSING")
-
-    print("Radar thread started.")
-
-    while True:
-        try:
-            process_latest_closed_candle()
-        except Exception as exc:
-            print(f"[ERROR] {type(exc).__name__}: {exc}")
-
-        time.sleep(POLL_SECONDS)
-
-
-@app.get("/")
-def home():
-    return jsonify(
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retries))
+    session.headers.update(
         {
-            "status": "online",
-            "bot": "PKLA BTC Discord Radar",
-            "product": COINBASE_PRODUCT,
-            "timeframe": "15m",
-            "last_sent_candle": last_sent_candle,
-            "last_signal": last_signal,
+            "User-Agent": "redrum-btc-radar/1.0",
+            "Accept": "application/json",
+            "Cache-Control": "no-cache",
+        }
+    )
+    return session
+
+
+SESSION = build_session()
+
+
+# ── State ────────────────────────────────────────────────────────────────────
+
+def default_state() -> dict:
+    return {
+        "service": "redrum-btc-radar",
+        "version": "1.0",
+        "source": "Coinbase, Kraken, Bitstamp",
+        "status": "running",
+        "timeframe": "15m",
+        "active_window": None,
+        "open_scan_sent": False,
+        "main_call_sent": False,
+        "opening_directions": {},
+        "last_radar_error": None,
+        "last_radar_sent_at": None,
+        "samples": [],
+    }
+
+
+def load_state() -> dict:
+    if not STATE_FILE.exists():
+        return default_state()
+
+    try:
+        state = default_state()
+        state.update(json.loads(STATE_FILE.read_text(encoding="utf-8")))
+        if not isinstance(state.get("samples"), list):
+            state["samples"] = []
+        return state
+    except (OSError, json.JSONDecodeError) as error:
+        logger.warning("Could not load state: %s", error)
+        return default_state()
+
+
+def save_state(state: dict) -> None:
+    try:
+        STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except OSError as error:
+        logger.error("Could not save state: %s", error)
+
+
+def reset_window_state(state: dict, window_key: str) -> None:
+    state["active_window"] = window_key
+    state["open_scan_sent"] = False
+    state["main_call_sent"] = False
+    state["opening_directions"] = {}
+    state["samples"] = []
+
+
+# ── Time / display helpers ───────────────────────────────────────────────────
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso_now() -> str:
+    return utc_now().isoformat()
+
+
+def floor_15m_timestamp(now: datetime) -> int:
+    ts = int(now.timestamp())
+    return ts - (ts % TIMEFRAME_SECONDS)
+
+
+def datetime_from_ts(ts: int) -> datetime:
+    return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+
+def money(value: Optional[float]) -> str:
+    return "N/A" if value is None else f"${value:,.2f}"
+
+
+def percent(value: float, signed: bool = True) -> str:
+    return f"{value:+.3f}%" if signed else f"{value:.3f}%"
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def safe_div(numerator: float, denominator: float, default: float = 0.0) -> float:
+    if abs(denominator) < 1e-12:
+        return default
+    return numerator / denominator
+
+
+def seconds_remaining(now: datetime, window_ts: int) -> float:
+    return max(0.0, (window_ts + TIMEFRAME_SECONDS) - now.timestamp())
+
+
+def elapsed_seconds(now: datetime, window_ts: int) -> float:
+    return max(0.0, now.timestamp() - window_ts)
+
+
+def mmss(seconds: float) -> str:
+    seconds_int = max(0, int(seconds))
+    minutes, secs = divmod(seconds_int, 60)
+    return f"{minutes}:{secs:02d}"
+
+
+# ── Candle normalization ─────────────────────────────────────────────────────
+
+def candle(ts: int, open_: float, high: float, low: float, close: float) -> dict:
+    return {
+        "ts": int(ts),
+        "open": float(open_),
+        "high": float(high),
+        "low": float(low),
+        "close": float(close),
+    }
+
+
+def normalize_history(name: str, candles: list[dict]) -> dict:
+    deduped = {int(item["ts"]): item for item in candles}
+    return {
+        "name": name,
+        "candles": [deduped[key] for key in sorted(deduped)],
+    }
+
+
+# ── Exchange data ────────────────────────────────────────────────────────────
+
+def get_coinbase_15m_history() -> Optional[dict]:
+    """
+    Coinbase Exchange public candle endpoint.
+    Schema: [time, low, high, open, close, volume]
+    """
+    try:
+        response = SESSION.get(
+            "https://api.exchange.coinbase.com/products/BTC-USD/candles",
+            params={"granularity": 900},
+            timeout=(5, 30),
+        )
+        response.raise_for_status()
+
+        rows = response.json()
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("Coinbase returned no candles.")
+
+        parsed = []
+        for row in rows[:80]:
+            if len(row) < 5:
+                continue
+            parsed.append(
+                candle(
+                    ts=int(row[0]),
+                    low=float(row[1]),
+                    high=float(row[2]),
+                    open_=float(row[3]),
+                    close=float(row[4]),
+                )
+            )
+
+        if not parsed:
+            raise ValueError("Coinbase candle rows could not be parsed.")
+
+        return normalize_history("Coinbase", parsed)
+
+    except (requests.RequestException, TypeError, ValueError, IndexError) as error:
+        logger.warning("Coinbase failed: %s", error)
+        return None
+
+
+def get_kraken_15m_history() -> Optional[dict]:
+    """
+    Kraken OHLC schema:
+    [time, open, high, low, close, vwap, volume, count]
+    Kraken includes the current, not-yet-committed candle as the final row.
+    """
+    try:
+        response = SESSION.get(
+            "https://api.kraken.com/0/public/OHLC",
+            params={"pair": "XBTUSD", "interval": 15},
+            timeout=(5, 30),
+        )
+        response.raise_for_status()
+
+        payload = response.json()
+        if payload.get("error"):
+            raise ValueError(", ".join(payload["error"]))
+
+        result = payload["result"]
+        pair_key = next(key for key in result if key != "last")
+        rows = result[pair_key]
+
+        parsed = []
+        for row in rows[-80:]:
+            if len(row) < 5:
+                continue
+            parsed.append(
+                candle(
+                    ts=int(float(row[0])),
+                    open_=float(row[1]),
+                    high=float(row[2]),
+                    low=float(row[3]),
+                    close=float(row[4]),
+                )
+            )
+
+        if not parsed:
+            raise ValueError("Kraken returned no usable candles.")
+
+        return normalize_history("Kraken", parsed)
+
+    except (
+        requests.RequestException,
+        KeyError,
+        TypeError,
+        ValueError,
+        IndexError,
+        StopIteration,
+    ) as error:
+        logger.warning("Kraken failed: %s", error)
+        return None
+
+
+def get_bitstamp_15m_history() -> Optional[dict]:
+    try:
+        response = SESSION.get(
+            "https://www.bitstamp.net/api/v2/ohlc/btcusd/",
+            params={"step": 900, "limit": 80},
+            timeout=(5, 30),
+        )
+        response.raise_for_status()
+
+        rows = response.json()["data"]["ohlc"]
+        if not rows:
+            raise ValueError("Bitstamp returned no candles.")
+
+        parsed = []
+        for row in rows:
+            parsed.append(
+                candle(
+                    ts=int(row["timestamp"]),
+                    open_=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                )
+            )
+
+        return normalize_history("Bitstamp", parsed)
+
+    except (
+        requests.RequestException,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as error:
+        logger.warning("Bitstamp failed: %s", error)
+        return None
+
+
+def get_all_market_histories() -> list[dict]:
+    histories = [
+        get_coinbase_15m_history(),
+        get_kraken_15m_history(),
+        get_bitstamp_15m_history(),
+    ]
+    return [history for history in histories if history is not None]
+
+
+# ── Synchronization ──────────────────────────────────────────────────────────
+
+def candle_map(history: dict) -> dict[int, dict]:
+    return {int(item["ts"]): item for item in history["candles"]}
+
+
+def synchronize_current_markets(
+    histories: list[dict],
+    window_ts: int,
+) -> tuple[list[dict], list[str]]:
+    by_name = {history["name"]: history for history in histories}
+    selected = []
+    missing = []
+
+    for name in REQUIRED_NAMES:
+        history = by_name.get(name)
+        if history is None:
+            missing.append(name)
+            continue
+
+        item = candle_map(history).get(window_ts)
+        if item is None:
+            missing.append(name)
+            continue
+
+        selected.append({"name": name, **item})
+
+    return selected, missing
+
+
+def synchronized_closed_returns(
+    histories: list[dict],
+    current_window_ts: int,
+    count: int = 6,
+) -> list[dict]:
+    by_name = {history["name"]: candle_map(history) for history in histories}
+    rows = []
+
+    for offset in range(count, 0, -1):
+        ts = current_window_ts - (offset * TIMEFRAME_SECONDS)
+        exchange_candles = []
+
+        for name in REQUIRED_NAMES:
+            item = by_name.get(name, {}).get(ts)
+            if item is None:
+                exchange_candles = []
+                break
+            exchange_candles.append(item)
+
+        if len(exchange_candles) != len(REQUIRED_NAMES):
+            continue
+
+        avg_open = mean(item["open"] for item in exchange_candles)
+        avg_close = mean(item["close"] for item in exchange_candles)
+        avg_high = mean(item["high"] for item in exchange_candles)
+        avg_low = mean(item["low"] for item in exchange_candles)
+
+        rows.append(
+            {
+                "ts": ts,
+                "open": avg_open,
+                "high": avg_high,
+                "low": avg_low,
+                "close": avg_close,
+                "change_pct": safe_div(avg_close - avg_open, avg_open) * 100,
+            }
+        )
+
+    return rows
+
+
+# ── Signal engine ────────────────────────────────────────────────────────────
+
+def market_direction(market: dict) -> tuple[str, float]:
+    change_pct = safe_div(market["close"] - market["open"], market["open"]) * 100
+
+    if market["close"] > market["open"]:
+        return "UP", change_pct
+    if market["close"] < market["open"]:
+        return "DOWN", change_pct
+    return "FLAT", change_pct
+
+
+def consensus(markets: list[dict]) -> tuple[str, int, int, int]:
+    if len(markets) != len(REQUIRED_NAMES) or {m["name"] for m in markets} != set(REQUIRED_NAMES):
+        return "NO TRADE", 0, 0, 0
+
+    bullish = 0
+    bearish = 0
+    flat = 0
+
+    for market in markets:
+        direction, _ = market_direction(market)
+        if direction == "UP":
+            bullish += 1
+        elif direction == "DOWN":
+            bearish += 1
+        else:
+            flat += 1
+
+    required = len(REQUIRED_NAMES)
+    if bullish == required:
+        return "UP", bullish, bearish, flat
+    if bearish == required:
+        return "DOWN", bullish, bearish, flat
+    return "NO TRADE", bullish, bearish, flat
+
+
+def aggregate_current(markets: list[dict]) -> dict:
+    avg_open = mean(m["open"] for m in markets)
+    avg_high = mean(m["high"] for m in markets)
+    avg_low = mean(m["low"] for m in markets)
+    avg_close = mean(m["close"] for m in markets)
+
+    change_pct = safe_div(avg_close - avg_open, avg_open) * 100
+    range_dollars = max(avg_high - avg_low, 0.01)
+    body_dollars = abs(avg_close - avg_open)
+    body_ratio = clamp(safe_div(body_dollars, range_dollars), 0.0, 1.0)
+
+    if avg_close >= avg_open:
+        location = clamp(safe_div(avg_close - avg_low, range_dollars), 0.0, 1.0)
+    else:
+        location = clamp(safe_div(avg_high - avg_close, range_dollars), 0.0, 1.0)
+
+    prices = [m["close"] for m in markets]
+    cross_spread_pct = safe_div(max(prices) - min(prices), avg_close) * 100
+
+    return {
+        "open": avg_open,
+        "high": avg_high,
+        "low": avg_low,
+        "price": avg_close,
+        "change_pct": change_pct,
+        "range_dollars": range_dollars,
+        "body_ratio": body_ratio,
+        "location": location,
+        "cross_spread_pct": cross_spread_pct,
+    }
+
+
+def add_sample(state: dict, window_key: str, current: dict, now: datetime) -> None:
+    samples = state.setdefault("samples", [])
+
+    if samples and samples[-1].get("window") != window_key:
+        samples.clear()
+
+    samples.append(
+        {
+            "window": window_key,
+            "ts": now.timestamp(),
+            "price": current["price"],
+            "change_pct": current["change_pct"],
         }
     )
 
+    cutoff = now.timestamp() - 300
+    state["samples"] = [sample for sample in samples if sample.get("ts", 0) >= cutoff][-40:]
 
-@app.get("/health")
-def health():
-    return jsonify({"status": "healthy"})
+
+def momentum_from_samples(state: dict, now: datetime, lookback_seconds: int = 60) -> dict:
+    samples = state.get("samples", [])
+    if len(samples) < 2:
+        return {"delta": 0.0, "delta_pct": 0.0, "direction": "FLAT"}
+
+    latest = samples[-1]
+    target_ts = now.timestamp() - lookback_seconds
+    prior = min(samples[:-1], key=lambda sample: abs(sample["ts"] - target_ts))
+
+    delta = latest["price"] - prior["price"]
+    delta_pct = safe_div(delta, prior["price"]) * 100
+
+    if delta > 0:
+        direction = "UP"
+    elif delta < 0:
+        direction = "DOWN"
+    else:
+        direction = "FLAT"
+
+    return {"delta": delta, "delta_pct": delta_pct, "direction": direction}
+
+
+def previous_trend(closed: list[dict]) -> dict:
+    if not closed:
+        return {"direction": "FLAT", "score": 50, "avg_change_pct": 0.0}
+
+    recent = closed[-3:]
+    avg_change = mean(row["change_pct"] for row in recent)
+    up_count = sum(1 for row in recent if row["change_pct"] > 0)
+    down_count = sum(1 for row in recent if row["change_pct"] < 0)
+
+    if up_count > down_count:
+        direction = "UP"
+    elif down_count > up_count:
+        direction = "DOWN"
+    else:
+        direction = "FLAT"
+
+    # Heuristic trend score, not a calibrated probability.
+    directional_ratio = max(up_count, down_count) / max(len(recent), 1)
+    magnitude = clamp(abs(avg_change) / 0.10, 0.0, 1.0)
+    score = round(clamp(50 + (directional_ratio * 25) + (magnitude * 20), 50, 95))
+
+    return {"direction": direction, "score": score, "avg_change_pct": avg_change}
+
+
+def model_metrics(
+    markets: list[dict],
+    current: dict,
+    momentum: dict,
+    closed: list[dict],
+) -> dict:
+    signal_type, bullish, bearish, flat = consensus(markets)
+
+    dominant = "UP" if bullish > bearish else "DOWN" if bearish > bullish else "FLAT"
+    agreement_pct = round((max(bullish, bearish) / len(REQUIRED_NAMES)) * 100)
+
+    move_strength = clamp(abs(current["change_pct"]) / 0.10, 0.0, 1.0) * 100
+    body_strength = current["body_ratio"] * 100
+    candle_location = current["location"] * 100
+
+    momentum_aligned = (
+        dominant in ("UP", "DOWN") and momentum["direction"] == dominant
+    )
+    momentum_opposed = (
+        dominant in ("UP", "DOWN")
+        and momentum["direction"] in ("UP", "DOWN")
+        and momentum["direction"] != dominant
+    )
+
+    momentum_strength = clamp(abs(momentum["delta_pct"]) / 0.05, 0.0, 1.0) * 100
+    if momentum_aligned:
+        momentum_component = 55 + (0.45 * momentum_strength)
+    elif momentum_opposed:
+        momentum_component = 45 - (0.45 * momentum_strength)
+    else:
+        momentum_component = 50
+
+    trend = previous_trend(closed)
+    trend_aligned = dominant in ("UP", "DOWN") and trend["direction"] == dominant
+    trend_component = trend["score"] if trend_aligned else (100 - trend["score"] if trend["direction"] != "FLAT" else 50)
+
+    raw_confidence = (
+        0.30 * agreement_pct
+        + 0.20 * move_strength
+        + 0.15 * body_strength
+        + 0.15 * candle_location
+        + 0.10 * momentum_component
+        + 0.10 * trend_component
+    )
+
+    # Penalize unusually wide cross-exchange price dispersion.
+    spread_penalty = clamp((current["cross_spread_pct"] - 0.03) * 200, 0, 10)
+    confidence = round(clamp(raw_confidence - spread_penalty, 1, 95))
+
+    proximity_to_open_pct = abs(current["change_pct"])
+    near_open_risk = 100 * (1 - clamp(proximity_to_open_pct / 0.08, 0.0, 1.0))
+    opposing_momentum_risk = momentum_strength if momentum_opposed else 0
+    weak_body_risk = 100 - body_strength
+    mixed_exchange_risk = 100 - agreement_pct
+
+    flip_risk = round(
+        clamp(
+            0.40 * near_open_risk
+            + 0.30 * opposing_momentum_risk
+            + 0.20 * weak_body_risk
+            + 0.10 * mixed_exchange_risk,
+            0,
+            100,
+        )
+    )
+
+    next_direction = "WAIT"
+    next_score = 50
+
+    directional_votes = 0
+    if signal_type == "UP":
+        directional_votes += 2
+    elif signal_type == "DOWN":
+        directional_votes -= 2
+
+    if momentum["direction"] == "UP":
+        directional_votes += 1
+    elif momentum["direction"] == "DOWN":
+        directional_votes -= 1
+
+    if trend["direction"] == "UP":
+        directional_votes += 1
+    elif trend["direction"] == "DOWN":
+        directional_votes -= 1
+
+    if current["change_pct"] > 0.03:
+        directional_votes += 1
+    elif current["change_pct"] < -0.03:
+        directional_votes -= 1
+
+    if directional_votes >= 3:
+        next_direction = "UP"
+    elif directional_votes <= -3:
+        next_direction = "DOWN"
+
+    next_score = round(clamp(50 + (abs(directional_votes) * 8), 50, 90))
+
+    return {
+        "strict_signal": signal_type,
+        "dominant": dominant,
+        "bullish": bullish,
+        "bearish": bearish,
+        "flat": flat,
+        "agreement_pct": agreement_pct,
+        "confidence": confidence,
+        "flip_risk": flip_risk,
+        "momentum": momentum,
+        "trend": trend,
+        "next_direction": next_direction,
+        "next_score": next_score,
+    }
+
+
+def qualified_main_call(metrics: dict, current: dict) -> str:
+    strict_signal = metrics["strict_signal"]
+
+    if strict_signal not in ("UP", "DOWN"):
+        return "WAIT"
+    if metrics["confidence"] < MIN_MAIN_CONFIDENCE:
+        return "WAIT"
+    if abs(current["change_pct"]) < MIN_ABS_MOVE_PCT:
+        return "WAIT"
+
+    return strict_signal
+
+
+# ── Discord helpers ──────────────────────────────────────────────────────────
+
+def discord_style(direction: str) -> tuple[str, int]:
+    if direction == "UP":
+        return "🟢", 0x2ECC71
+    if direction == "DOWN":
+        return "🔴", 0xE74C3C
+    return "⚪", 0x95A5A6
+
+
+def exchange_status(market: dict, stage: str, opening_directions: dict) -> tuple[str, str]:
+    """
+    Color key requested for Discord:
+    🟩 GREEN = direction UP
+    🟥 RED   = direction DOWN
+    🟨 YELLOW = GET OUT because this exchange reversed from its opening direction
+    ⬛ BLACK  = HOLD because the exchange is flat / not giving a fresh directional push
+    """
+    direction, change_pct = market_direction(market)
+
+    if stage == "MID":
+        opening = opening_directions.get(market["name"])
+        if opening in ("UP", "DOWN") and direction in ("UP", "DOWN") and direction != opening:
+            return "🟨", "GET OUT"
+
+    if direction == "UP":
+        return "🟩", "UP"
+    if direction == "DOWN":
+        return "🟥", "DOWN"
+    return "⬛", "HOLD"
+
+
+def exchange_lines(markets: list[dict], stage: str, opening_directions: dict) -> str:
+    lines = []
+    for market in sorted(markets, key=lambda item: item["name"]):
+        _, change_pct = market_direction(market)
+        icon, status = exchange_status(market, stage, opening_directions)
+        lines.append(
+            f"{icon} **{market['name']}** — **{status}** {percent(change_pct)} | {money(market['close'])}"
+        )
+    return "\n".join(lines)
+
+
+def send_discord_embed(embed: dict) -> tuple[bool, Optional[str]]:
+    if not DISCORD_WEBHOOK_URL:
+        return False, "DISCORD_WEBHOOK_URL is missing."
+
+    payload = {
+        "username": "REDRUM BTC Radar",
+        "embeds": [embed],
+    }
+
+    try:
+        response = SESSION.post(
+            DISCORD_WEBHOOK_URL,
+            json=payload,
+            timeout=(5, 30),
+        )
+        response.raise_for_status()
+        return True, None
+    except requests.RequestException as error:
+        return False, str(error)
+
+
+def make_embed(
+    stage: str,
+    window_ts: int,
+    remaining: float,
+    markets: list[dict],
+    current: dict,
+    metrics: dict,
+    opening_directions: dict,
+) -> dict:
+    main_call = qualified_main_call(metrics, current)
+
+    if stage == "OPEN":
+        displayed_direction = metrics["strict_signal"]
+        call_text = "OPENING CALL — HOLD" if displayed_direction == "NO TRADE" else f"OPENING CALL — {displayed_direction}"
+        title_prefix = "OPENING CALL"
+    else:
+        displayed_direction = main_call if main_call != "WAIT" else "WAIT"
+        call_text = f"MIDPOINT CALL — {main_call}" if main_call in ("UP", "DOWN") else "MIDPOINT CALL — HOLD / WAIT"
+        title_prefix = "MIDPOINT CALL"
+
+    emoji, color = discord_style(displayed_direction)
+
+    momentum = metrics["momentum"]
+    trend = metrics["trend"]
+    price_vs_open = current["price"] - current["open"]
+
+    if metrics["next_direction"] in ("UP", "DOWN"):
+        next_text = f"{metrics['next_direction']} ({metrics['next_score']} heuristic score)"
+    else:
+        next_text = "WAIT"
+
+    return {
+        "title": f"{emoji} REDRUM BTC 15M — {title_prefix}",
+        "description": (
+            f"**{call_text}**\n"
+            "Three-exchange synchronized BTC/USD radar"
+        ),
+        "color": color,
+        "fields": [
+            {
+                "name": "₿ BTC PRICE",
+                "value": (
+                    f"Average: **{money(current['price'])}**\n"
+                    f"15m Open: **{money(current['open'])}**\n"
+                    f"Vs Open: **{price_vs_open:+,.2f} ({percent(current['change_pct'])})**"
+                ),
+                "inline": False,
+            },
+            {
+                "name": "📣 CURRENT CALL",
+                "value": f"**{call_text}**",
+                "inline": True,
+            },
+            {
+                "name": "🧠 MODEL CONFIDENCE",
+                "value": f"**{metrics['confidence']}%**\n*heuristic, not win probability*",
+                "inline": True,
+            },
+            {
+                "name": "⚠️ FLIP RISK",
+                "value": f"**{metrics['flip_risk']}%**",
+                "inline": True,
+            },
+            {
+                "name": "⏱️ TIME LEFT",
+                "value": f"**{mmss(remaining)}**",
+                "inline": True,
+            },
+            {
+                "name": "🤝 EXCHANGE AGREEMENT",
+                "value": (
+                    f"Bullish: **{metrics['bullish']}/{len(REQUIRED_NAMES)}**\n"
+                    f"Bearish: **{metrics['bearish']}/{len(REQUIRED_NAMES)}**\n"
+                    f"Agreement: **{metrics['agreement_pct']}%**\n"
+                    f"Strict signal: **{metrics['strict_signal']}**"
+                ),
+                "inline": True,
+            },
+            {
+                "name": "⚡ 60s MOMENTUM",
+                "value": (
+                    f"Direction: **{momentum['direction']}**\n"
+                    f"Move: **{momentum['delta']:+,.2f} ({percent(momentum['delta_pct'])})**"
+                ),
+                "inline": True,
+            },
+            {
+                "name": "📚 PREVIOUS 3-CANDLE TREND",
+                "value": (
+                    f"Direction: **{trend['direction']}**\n"
+                    f"Avg change: **{percent(trend['avg_change_pct'])}**"
+                ),
+                "inline": True,
+            },
+            {
+                "name": "🔮 NEXT CANDLE LEAN",
+                "value": f"**{next_text}**",
+                "inline": True,
+            },
+            {
+                "name": "🏦 EXCHANGE COLOR CODE",
+                "value": exchange_lines(markets, stage, opening_directions),
+                "inline": False,
+            },
+            {
+                "name": "🎨 COLOR KEY",
+                "value": "🟩 **UP**  |  🟥 **DOWN**  |  🟨 **GET OUT**  |  ⬛ **HOLD**",
+                "inline": False,
+            },
+            {
+                "name": "🕒 CANDLE",
+                "value": (
+                    f"Opened: **{datetime_from_ts(window_ts).strftime('%Y-%m-%d %H:%M UTC')}**\n"
+                    f"Stage: **{stage}**"
+                ),
+                "inline": False,
+            },
+        ],
+        "footer": {
+            "text": (
+                "REDRUM uses synchronized Coinbase, Kraken, and Bitstamp plus quality gates. "
+                "Model confidence is a heuristic signal score, not a guaranteed probability."
+            )
+        },
+        "timestamp": iso_now(),
+    }
+
+
+def send_stage(
+    stage: str,
+    window_ts: int,
+    remaining: float,
+    markets: list[dict],
+    current: dict,
+    metrics: dict,
+    opening_directions: dict,
+) -> tuple[bool, Optional[str]]:
+    embed = make_embed(
+        stage=stage,
+        window_ts=window_ts,
+        remaining=remaining,
+        markets=markets,
+        current=current,
+        metrics=metrics,
+        opening_directions=opening_directions,
+    )
+    return send_discord_embed(embed)
+
+
+# ── Main scanner ─────────────────────────────────────────────────────────────
+
+def scan_once(state: dict) -> dict:
+    now = utc_now()
+    window_ts = floor_15m_timestamp(now)
+    window_key = datetime_from_ts(window_ts).isoformat()
+
+    if state.get("active_window") != window_key:
+        reset_window_state(state, window_key)
+
+    histories = get_all_market_histories()
+    history_names = {history["name"] for history in histories}
+
+    if history_names != set(REQUIRED_NAMES):
+        missing = sorted(set(REQUIRED_NAMES) - history_names)
+        state["last_radar_error"] = f"Missing exchange histories: {', '.join(missing)}"
+        state["status"] = "running"
+        save_state(state)
+        return state
+
+    markets, missing_current = synchronize_current_markets(histories, window_ts)
+    if missing_current:
+        state["last_radar_error"] = (
+            "Current 15m candle is not synchronized yet for: "
+            + ", ".join(missing_current)
+        )
+        state["status"] = "running"
+        save_state(state)
+        return state
+
+    current = aggregate_current(markets)
+    add_sample(state, window_key, current, now)
+    momentum = momentum_from_samples(state, now, lookback_seconds=60)
+    closed = synchronized_closed_returns(histories, window_ts, count=6)
+    metrics = model_metrics(markets, current, momentum, closed)
+
+    elapsed = elapsed_seconds(now, window_ts)
+    remaining = seconds_remaining(now, window_ts)
+
+    state["last_radar_error"] = None
+    state["status"] = "running"
+
+    # 1) Opening scan: informational only. Sends once after opening delay.
+    if not state.get("open_scan_sent") and elapsed >= OPEN_SCAN_DELAY_SECONDS:
+        success, error = send_stage(
+            "OPEN", window_ts, remaining, markets, current, metrics, state.get("opening_directions", {})
+        )
+        if success:
+            state["open_scan_sent"] = True
+            state["opening_directions"] = {m["name"]: market_direction(m)[0] for m in markets}
+            state["last_radar_sent_at"] = iso_now()
+            logger.info("OPEN scan sent for %s", window_key)
+        else:
+            state["last_radar_error"] = f"Discord OPEN failed: {error}"
+            logger.error("Discord OPEN failed: %s", error)
+
+    # 2) Midpoint call: fires at the middle of the 15-minute candle (7:30 elapsed by default).
+    main_threshold_seconds = MAIN_CALL_REMAINING_MINUTES * 60
+    if not state.get("main_call_sent") and remaining <= main_threshold_seconds:
+        success, error = send_stage(
+            "MID", window_ts, remaining, markets, current, metrics, state.get("opening_directions", {})
+        )
+        if success:
+            state["main_call_sent"] = True
+            state["last_radar_sent_at"] = iso_now()
+            logger.info(
+                "MAIN call sent for %s: %s confidence=%s flip=%s",
+                window_key,
+                qualified_main_call(metrics, current),
+                metrics["confidence"],
+                metrics["flip_risk"],
+            )
+        else:
+            state["last_radar_error"] = f"Discord MIDPOINT failed: {error}"
+            logger.error("Discord MIDPOINT failed: %s", error)
+
+
+    save_state(state)
+    return state
+
+
+def shutdown(signum, frame) -> None:
+    global RUNNING
+    RUNNING = False
+    logger.info("Shutdown signal received.")
+
+
+def main() -> None:
+    if not DISCORD_WEBHOOK_URL:
+        raise SystemExit(
+            "DISCORD_WEBHOOK_URL is missing. Add it to your environment variables."
+        )
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    state = load_state()
+
+    logger.info("REDRUM BTC Radar started.")
+    logger.info("15m synchronized: Coinbase, Kraken, Bitstamp.")
+    logger.info(
+        "Two calls only: OPEN after %ss | MIDPOINT at <= %.1fm left",
+        OPEN_SCAN_DELAY_SECONDS,
+        MAIN_CALL_REMAINING_MINUTES,
+    )
+    logger.info(
+        "Main quality gates: 3/3 strict + confidence >= %s + abs move >= %.3f%%",
+        MIN_MAIN_CONFIDENCE,
+        MIN_ABS_MOVE_PCT,
+    )
+
+    while RUNNING:
+        try:
+            state = scan_once(state)
+        except Exception as error:
+            state["last_radar_error"] = f"Unexpected scanner error: {error}"
+            state["status"] = "running"
+            save_state(state)
+            logger.exception("Unexpected scanner error")
+
+        for _ in range(POLL_SECONDS):
+            if not RUNNING:
+                break
+            time.sleep(1)
+
+    state["status"] = "stopped"
+    save_state(state)
+    logger.info("REDRUM BTC Radar stopped.")
 
 
 if __name__ == "__main__":
-    thread = threading.Thread(target=radar_loop, daemon=True)
-    thread.start()
-
-    print(f"Starting web server on port {PORT}...")
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    main()
