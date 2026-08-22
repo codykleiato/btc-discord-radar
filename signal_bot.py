@@ -6,7 +6,6 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Thread
-from typing import Optional
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -34,6 +33,12 @@ from flask import Flask, jsonify
 #
 # TIMING:
 #   Sends once as soon as a new 15-minute candle opens.
+#
+# RELIABILITY:
+#   Uses the CLOCK to detect new 15-minute candles.
+#   Does not depend on Coinbase publishing the new candle immediately.
+#   Retries Coinbase and Discord requests automatically.
+#   Saves state so duplicate signals are avoided.
 #
 # RENDER:
 #   Includes HTTP health server.
@@ -153,10 +158,10 @@ logger = logging.getLogger(
 def build_session() -> requests.Session:
 
     retries = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        status=3,
+        total=5,
+        connect=5,
+        read=5,
+        status=5,
         backoff_factor=1.0,
         status_forcelist=(
             408,
@@ -579,7 +584,7 @@ def calculate_macd(
 
 def analyze_market(candles):
 
-    closed = candles[:-1]
+    closed = candles
 
     if len(closed) < 50:
 
@@ -713,15 +718,6 @@ def analyze_market(candles):
     # PRICE VS TARGET
     # -------------------------------------------------------------------------
 
-    # Target is based on the short-term EMA structure.
-    #
-    # Bullish:
-    #   target moves toward EMA9/EMA21 upside continuation.
-    #
-    # Bearish:
-    #   target moves toward EMA9/EMA21 downside continuation.
-    # -------------------------------------------------------------------------
-
     ema_mid = (
         ema9 + ema21
     ) / 2
@@ -835,7 +831,6 @@ def analyze_market(candles):
 
         confidence = 50
 
-    # Keep confidence within reasonable bounds.
     confidence = max(
         50,
         min(
@@ -1129,7 +1124,6 @@ def send_discord(
         ],
     }
 
-    # Optional Discord webhook avatar.
     avatar_url = os.getenv(
         "DISCORD_AVATAR_URL",
         "",
@@ -1192,7 +1186,11 @@ def scan(
     ] = window_key
 
     # -------------------------------------------------------------------------
-    # Only send once per new 15-minute candle.
+    # ONLY SEND ONCE PER NEW 15-MINUTE CANDLE.
+    #
+    # IMPORTANT:
+    # The clock determines when the candle opens.
+    # We do NOT require Coinbase to have already published the new candle.
     # -------------------------------------------------------------------------
 
     if (
@@ -1219,33 +1217,36 @@ def scan(
         return state
 
     # -------------------------------------------------------------------------
-    # Wait until Coinbase has created the NEW candle.
+    # GET ONLY COMPLETED CANDLES.
+    #
+    # Any candle whose timestamp is before the current 15-minute window
+    # has already closed.
     # -------------------------------------------------------------------------
 
-    newest_timestamp = candles[-1][
-        "timestamp"
+    closed_candles = [
+        candle
+        for candle in candles
+        if candle["timestamp"] < current_window
     ]
 
-    if (
-        newest_timestamp
-        < current_window
-    ):
+    if len(closed_candles) < 50:
 
-        logger.info(
-            "Waiting for new 15m candle: %s",
-            window_key,
+        state["last_error"] = (
+            "Not enough closed candles for analysis."
         )
+
+        save_state(state)
 
         return state
 
     # -------------------------------------------------------------------------
-    # Analyze using closed candles.
+    # ANALYZE THE MOST RECENT COMPLETED CANDLE DATA.
     # -------------------------------------------------------------------------
 
     try:
 
         result = analyze_market(
-            candles
+            closed_candles
         )
 
     except Exception as error:
@@ -1263,7 +1264,7 @@ def scan(
         return state
 
     # -------------------------------------------------------------------------
-    # Send Discord call.
+    # SEND DISCORD CALL.
     # -------------------------------------------------------------------------
 
     success, error = (
@@ -1287,10 +1288,12 @@ def scan(
         ] = None
 
         logger.info(
-            "15m signal sent: %s | "
+            "15m signal sent for new candle: %s | "
+            "direction=%s | "
             "confidence=%s | "
             "bullish=%s | "
             "bearish=%s",
+            window_key,
             result["direction"],
             result["confidence"],
             result["bullish"],
@@ -1376,6 +1379,12 @@ def main():
     logger.info(
         "Discord timing: once at the start "
         "of every new 15-minute candle."
+    )
+
+    logger.info(
+        "Candle detection uses UTC clock timing "
+        "and does not depend on the new Coinbase "
+        "candle appearing immediately."
     )
 
     # -------------------------------------------------------------------------
