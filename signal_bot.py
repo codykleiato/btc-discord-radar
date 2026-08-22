@@ -2,13 +2,14 @@
 """
 btc_discord_radar.py
 
-BTC 15-minute Discord radar using Coinbase BTC-USD spot price.
+BTC 15-minute technical-analysis radar for Discord.
+Informational only. No strategy can guarantee profits or win rate.
 
 Install:
     pip install requests
 
 Run:
-    export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/WEBHOOK_ID/WEBHOOK_TOKEN"
+    export DISCORD_WEBHOOK_URL="YOUR_DISCORD_WEBHOOK_URL"
     python btc_discord_radar.py
 """
 
@@ -26,26 +27,35 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
-# ── Configuration ────────────────────────────────────────────────────────────
+# ── Settings ─────────────────────────────────────────────────────────────────
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
-COINBASE_PAIR = "BTC-USD"
-COINBASE_URL = f"https://api.coinbase.com/v2/prices/{COINBASE_PAIR}/spot"
+PAIR = "BTC-USD"
+COINBASE_URL = f"https://api.coinbase.com/v2/prices/{PAIR}/spot"
 
 POLL_SECONDS = 10
 TIMEFRAME_MINUTES = 15
 
-# Set this to match the exact target listed on a Kalshi market.
-# Example: If the listed target is $25 above the 15m candle open, use 25.0.
+# Add/subtract this if the Kalshi target differs from the 15-minute opening price.
 KALSHI_TARGET_OFFSET_USD = 0.0
 
-# Signal filters. Set to False for simpler target-only alerts.
-REQUIRE_CANDLE_DIRECTION = True
-REQUIRE_EMA_TREND = True
+# Trading levels. Adjust to your own risk rules.
+ATR_LENGTH = 14
+STOP_ATR_MULTIPLIER = 1.25
+TAKE_PROFIT_ATR_MULTIPLIER = 1.75
 
 FAST_EMA_LENGTH = 9
-SLOW_EMA_LENGTH = 21
+MID_EMA_LENGTH = 21
+SLOW_EMA_LENGTH = 40
+RSI_LENGTH = 14
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+
+# Needs enough history to calculate EMA40, RSI14, MACD26, and ATR14.
+MAX_PRICE_HISTORY = 250
+MIN_HISTORY_FOR_ALERTS = 50
 
 STATE_FILE = Path("btc_radar_state.json")
 LOG_FILE = Path("btc_radar.log")
@@ -66,7 +76,7 @@ logging.basicConfig(
 logger = logging.getLogger("btc-discord-radar")
 
 
-# ── HTTP session with retry protection ───────────────────────────────────────
+# ── Reliable HTTP requests ───────────────────────────────────────────────────
 
 def build_session() -> requests.Session:
     retry = Retry(
@@ -77,21 +87,15 @@ def build_session() -> requests.Session:
         backoff_factor=1.5,
         status_forcelist=(408, 429, 500, 502, 503, 504),
         allowed_methods=frozenset(["GET", "POST"]),
-        respect_retry_after_header=True,
         raise_on_status=False,
-    )
-
-    adapter = HTTPAdapter(
-        max_retries=retry,
-        pool_connections=10,
-        pool_maxsize=10,
+        respect_retry_after_header=True,
     )
 
     session = requests.Session()
-    session.mount("https://", adapter)
+    session.mount("https://", HTTPAdapter(max_retries=retry))
     session.headers.update(
         {
-            "User-Agent": "btc-discord-radar/1.0",
+            "User-Agent": "btc-discord-radar/2.0",
             "Accept": "application/json",
         }
     )
@@ -101,7 +105,7 @@ def build_session() -> requests.Session:
 SESSION = build_session()
 
 
-# ── Persistent state ─────────────────────────────────────────────────────────
+# ── State ────────────────────────────────────────────────────────────────────
 
 def default_state() -> dict:
     return {
@@ -117,7 +121,7 @@ def default_state() -> dict:
         "last_signal_window": None,
         "last_radar_sent_at": None,
         "last_radar_error": None,
-        "ema_prices": [],
+        "prices": [],
     }
 
 
@@ -131,21 +135,18 @@ def load_state() -> dict:
         state.update(saved)
         return state
     except (OSError, json.JSONDecodeError) as error:
-        logger.warning("Could not load state; starting fresh: %s", error)
+        logger.warning("Could not read saved state: %s", error)
         return default_state()
 
 
 def save_state(state: dict) -> None:
     try:
-        STATE_FILE.write_text(
-            json.dumps(state, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
     except OSError as error:
         logger.error("Could not save state: %s", error)
 
 
-# ── Time and price helpers ───────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -155,134 +156,349 @@ def iso_now() -> str:
     return utc_now().isoformat()
 
 
-def fifteen_minute_window(now: datetime) -> datetime:
-    minute = now.minute - (now.minute % TIMEFRAME_MINUTES)
-    return now.replace(minute=minute, second=0, microsecond=0)
+def get_15m_window(now: datetime) -> datetime:
+    rounded_minute = now.minute - (now.minute % TIMEFRAME_MINUTES)
+    return now.replace(minute=rounded_minute, second=0, microsecond=0)
 
 
-def format_usd(value: Optional[float]) -> str:
-    if value is None:
-        return "N/A"
-    return f"${value:,.2f}"
+def money(value: Optional[float]) -> str:
+    return "N/A" if value is None else f"${value:,.2f}"
+
+
+def signed_money(value: float) -> str:
+    return f"{'+' if value >= 0 else '-'}${abs(value):,.2f}"
 
 
 def get_btc_price() -> Optional[float]:
     try:
-        response = SESSION.get(
-            COINBASE_URL,
-            timeout=(5, 45),  # connect timeout, read timeout
-        )
+        response = SESSION.get(COINBASE_URL, timeout=(5, 45))
         response.raise_for_status()
 
-        payload = response.json()
-        price = float(payload["data"]["amount"])
-
+        price = float(response.json()["data"]["amount"])
         if price <= 0:
-            raise ValueError(f"Invalid BTC price received: {price}")
+            raise ValueError("Coinbase returned an invalid BTC price.")
 
         return price
 
-    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as error:
-        logger.warning("Coinbase network timeout/connection error: %s", error)
+    except (
+        requests.exceptions.RequestException,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as error:
+        logger.warning("Coinbase request failed: %s", error)
         return None
 
-    except (requests.exceptions.RequestException, KeyError, TypeError, ValueError) as error:
-        logger.warning("Coinbase price request failed: %s", error)
-        return None
 
-
-# ── EMA logic ────────────────────────────────────────────────────────────────
-
-def calculate_ema(values: list[float], length: int) -> Optional[float]:
+def ema(values: list[float], length: int) -> Optional[float]:
     if len(values) < length:
         return None
 
-    multiplier = 2 / (length + 1)
-    ema = values[0]
+    smoothing = 2 / (length + 1)
+    result = values[0]
 
     for value in values[1:]:
-        ema = (value - ema) * multiplier + ema
+        result = (value - result) * smoothing + result
 
-    return ema
-
-
-def update_price_history(state: dict, price: float) -> None:
-    prices = state.get("ema_prices", [])
-    prices.append(price)
-
-    # Keep enough samples for both EMAs but avoid unlimited state-file growth.
-    max_samples = max(SLOW_EMA_LENGTH * 4, 100)
-    state["ema_prices"] = prices[-max_samples:]
+    return result
 
 
-# ── Discord ──────────────────────────────────────────────────────────────────
+def rsi(values: list[float], length: int) -> Optional[float]:
+    if len(values) < length + 1:
+        return None
 
-def send_discord_alert(
-    signal_type: str,
+    changes = [
+        values[index] - values[index - 1]
+        for index in range(1, len(values))
+    ]
+
+    recent = changes[-length:]
+    gains = [change for change in recent if change > 0]
+    losses = [-change for change in recent if change < 0]
+
+    average_gain = sum(gains) / length
+    average_loss = sum(losses) / length
+
+    if average_loss == 0:
+        return 100.0
+
+    relative_strength = average_gain / average_loss
+    return 100 - (100 / (1 + relative_strength))
+
+
+def macd(values: list[float]) -> tuple[Optional[float], Optional[float]]:
+    if len(values) < MACD_SLOW + MACD_SIGNAL:
+        return None, None
+
+    macd_line_values = []
+
+    for end in range(MACD_SLOW, len(values) + 1):
+        subset = values[:end]
+        fast = ema(subset, MACD_FAST)
+        slow = ema(subset, MACD_SLOW)
+
+        if fast is not None and slow is not None:
+            macd_line_values.append(fast - slow)
+
+    if len(macd_line_values) < MACD_SIGNAL:
+        return None, None
+
+    macd_line = macd_line_values[-1]
+    signal_line = ema(macd_line_values, MACD_SIGNAL)
+
+    return macd_line, signal_line
+
+
+def atr(values: list[float], length: int) -> Optional[float]:
+    if len(values) < length + 1:
+        return None
+
+    movements = [
+        abs(values[index] - values[index - 1])
+        for index in range(1, len(values))
+    ]
+    return sum(movements[-length:]) / length
+
+
+# ── Analysis ─────────────────────────────────────────────────────────────────
+
+def analyze(price: float, prices: list[float], target: float) -> Optional[dict]:
+    if len(prices) < MIN_HISTORY_FOR_ALERTS:
+        return None
+
+    ema9 = ema(prices, FAST_EMA_LENGTH)
+    ema21 = ema(prices, MID_EMA_LENGTH)
+    ema40 = ema(prices, SLOW_EMA_LENGTH)
+    rsi_value = rsi(prices, RSI_LENGTH)
+    macd_line, signal_line = macd(prices)
+    atr_value = atr(prices, ATR_LENGTH)
+
+    if any(
+        item is None
+        for item in (
+            ema9,
+            ema21,
+            ema40,
+            rsi_value,
+            macd_line,
+            signal_line,
+            atr_value,
+        )
+    ):
+        return None
+
+    bullish = 0
+    bearish = 0
+    reasons = []
+
+    # 1. EMA9 vs EMA21
+    if ema9 > ema21:
+        bullish += 1
+        reasons.append(("🟢", "EMA9 > EMA21"))
+    else:
+        bearish += 1
+        reasons.append(("🔴", "EMA9 < EMA21"))
+
+    # 2. BTC above/below EMA40
+    if price > ema40:
+        bullish += 1
+        reasons.append(("🟢", "BTC above EMA40"))
+    else:
+        bearish += 1
+        reasons.append(("🔴", "BTC below EMA40"))
+
+    # 3. RSI
+    if rsi_value >= 55:
+        bullish += 1
+        reasons.append(("🟢", f"RSI bullish ({rsi_value:.1f})"))
+    elif rsi_value <= 45:
+        bearish += 1
+        reasons.append(("🔴", f"RSI bearish ({rsi_value:.1f})"))
+    else:
+        reasons.append(("⚪", f"RSI neutral ({rsi_value:.1f})"))
+
+    # 4. MACD
+    if macd_line > signal_line:
+        bullish += 1
+        reasons.append(("🟢", "MACD bullish"))
+    else:
+        bearish += 1
+        reasons.append(("🔴", "MACD bearish"))
+
+    # 5. Position relative to 15-minute target
+    if price > target:
+        bullish += 1
+        reasons.append(("🟢", "BTC above 15m target"))
+    else:
+        bearish += 1
+        reasons.append(("🔴", "BTC below 15m target"))
+
+    gap = bullish - bearish
+
+    if gap >= 2:
+        signal_type = "UP"
+    elif gap <= -2:
+        signal_type = "DOWN"
+    else:
+        signal_type = "NEUTRAL"
+
+    # Confidence is a score estimate, not a probability or win-rate claim.
+    total_directional = bullish + bearish
+    confidence = round((max(bullish, bearish) / total_directional) * 100)
+
+    return {
+        "signal_type": signal_type,
+        "bullish": bullish,
+        "bearish": bearish,
+        "gap": gap,
+        "confidence": confidence,
+        "ema9": ema9,
+        "ema21": ema21,
+        "ema40": ema40,
+        "rsi": rsi_value,
+        "macd": macd_line,
+        "macd_signal": signal_line,
+        "atr": atr_value,
+        "reasons": reasons,
+    }
+
+
+def trade_levels(price: float, signal_type: str, atr_value: float) -> tuple[float, float]:
+    if signal_type == "UP":
+        take_profit = price + (atr_value * TAKE_PROFIT_ATR_MULTIPLIER)
+        stop_loss = price - (atr_value * STOP_ATR_MULTIPLIER)
+    else:
+        take_profit = price - (atr_value * TAKE_PROFIT_ATR_MULTIPLIER)
+        stop_loss = price + (atr_value * STOP_ATR_MULTIPLIER)
+
+    return take_profit, stop_loss
+
+
+# ── Discord embed ────────────────────────────────────────────────────────────
+
+def send_discord_callout(
     price: float,
     target: float,
+    analysis: dict,
     window_start: datetime,
-    fast_ema: Optional[float],
-    slow_ema: Optional[float],
 ) -> tuple[bool, Optional[str]]:
 
     if not DISCORD_WEBHOOK_URL:
-        return False, "DISCORD_WEBHOOK_URL is not set"
+        return False, "DISCORD_WEBHOOK_URL is missing."
 
-    is_buy = signal_type == "BUY"
-    color = 0x2ECC71 if is_buy else 0xE74C3C
-    direction = "ABOVE" if is_buy else "BELOW"
-    emoji = "🟢" if is_buy else "🔴"
+    signal_type = analysis["signal_type"]
+    is_up = signal_type == "UP"
 
-    description = (
-        f"{emoji} **{signal_type} RADAR**\n"
-        f"BTC is currently **{direction}** the 15-minute target."
+    if is_up:
+        emoji = "🟢"
+        title = "BTC UP SIGNAL"
+        bet_text = "BET UP"
+        color = 0x2ECC71
+    else:
+        emoji = "🔴"
+        title = "BTC DOWN SIGNAL"
+        bet_text = "BET DOWN"
+        color = 0xE74C3C
+
+    take_profit, stop_loss = trade_levels(
+        price,
+        signal_type,
+        analysis["atr"],
     )
 
-    payload = {
-        "username": "BTC 15m Radar",
-        "embeds": [
+    analysis_text = "\n".join(
+        f"{emoji_item} {reason}"
+        for emoji_item, reason in analysis["reasons"]
+    )
+
+    hold_text = "2 candle(s) / up to 30 minutes"
+    target_difference = price - target
+
+    embed = {
+        "title": f"{emoji} {title}",
+        "description": (
+            "**PKLA BTC 15-Minute Market Radar**\n"
+            "Coinbase BTC-USD technical analysis"
+        ),
+        "color": color,
+        "fields": [
             {
-                "title": f"BTC-USD 15m {signal_type} Signal",
-                "description": description,
-                "color": color,
-                "fields": [
-                    {
-                        "name": "Current BTC Price",
-                        "value": format_usd(price),
-                        "inline": True,
-                    },
-                    {
-                        "name": "15m Target",
-                        "value": format_usd(target),
-                        "inline": True,
-                    },
-                    {
-                        "name": "Difference",
-                        "value": format_usd(abs(price - target)),
-                        "inline": True,
-                    },
-                    {
-                        "name": "15m Window Start (UTC)",
-                        "value": window_start.strftime("%Y-%m-%d %H:%M"),
-                        "inline": False,
-                    },
-                    {
-                        "name": "Fast EMA / Slow EMA",
-                        "value": (
-                            f"{format_usd(fast_ema)} / {format_usd(slow_ema)}"
-                            if fast_ema is not None and slow_ema is not None
-                            else "Warming up"
-                        ),
-                        "inline": False,
-                    },
-                ],
-                "footer": {
-                    "text": "Coinbase BTC-USD spot | Signal is informational only",
-                },
-                "timestamp": iso_now(),
-            }
+                "name": "₿ BTC PRICE",
+                "value": f"**{money(price)}**",
+                "inline": False,
+            },
+            {
+                "name": "📊 SIGNAL",
+                "value": f"**{bet_text}**",
+                "inline": True,
+            },
+            {
+                "name": "🎯 CONFIDENCE",
+                "value": f"**{analysis['confidence']}%**",
+                "inline": True,
+            },
+            {
+                "name": "🕯️ HOLD",
+                "value": f"**{hold_text}**",
+                "inline": True,
+            },
+            {
+                "name": "📈 SCORE",
+                "value": (
+                    f"Bullish: **{analysis['bullish']}**\n"
+                    f"Bearish: **{analysis['bearish']}**\n"
+                    f"Gap: **{analysis['gap']:+d}**"
+                ),
+                "inline": False,
+            },
+            {
+                "name": "📐 INDICATORS",
+                "value": (
+                    f"RSI: **{analysis['rsi']:.1f}**\n"
+                    f"MACD: **{analysis['macd']:.2f}**\n"
+                    f"Signal: **{analysis['macd_signal']:.2f}**\n"
+                    f"EMA9: **{money(analysis['ema9'])}**\n"
+                    f"EMA21: **{money(analysis['ema21'])}**\n"
+                    f"EMA40: **{money(analysis['ema40'])}**"
+                ),
+                "inline": False,
+            },
+            {
+                "name": "📍 TRADE LEVELS",
+                "value": (
+                    f"Entry: **{money(price)}**\n"
+                    f"Take Profit: **{money(take_profit)}**\n"
+                    f"Stop Loss: **{money(stop_loss)}**"
+                ),
+                "inline": False,
+            },
+            {
+                "name": "🎯 15-MINUTE TARGET",
+                "value": (
+                    f"Target: **{money(target)}**\n"
+                    f"Difference: **{signed_money(target_difference)}**\n"
+                    f"Window: **{window_start.strftime('%H:%M UTC')}**"
+                ),
+                "inline": False,
+            },
+            {
+                "name": "🔬 ANALYSIS",
+                "value": analysis_text,
+                "inline": False,
+            },
         ],
+        "footer": {
+            "text": (
+                "Informational analysis only — not financial advice. "
+                "No signal guarantees an outcome."
+            )
+        },
+        "timestamp": iso_now(),
+    }
+
+    payload = {
+        "username": "PKLA BTC Radar",
+        "embeds": [embed],
     }
 
     try:
@@ -298,80 +514,23 @@ def send_discord_alert(
         return False, str(error)
 
 
-# ── Signal logic ─────────────────────────────────────────────────────────────
-
-def determine_signal(
-    price: float,
-    target: float,
-    window_open_price: float,
-    fast_ema: Optional[float],
-    slow_ema: Optional[float],
-) -> Optional[str]:
-    """
-    BUY: BTC is above the target, current 15m candle is green,
-         and optional EMA trend is bullish.
-
-    SELL: BTC is below the target, current 15m candle is red,
-          and optional EMA trend is bearish.
-    """
-    above_target = price > target
-    below_target = price < target
-
-    candle_green = price > window_open_price
-    candle_red = price < window_open_price
-
-    ema_bullish = (
-        fast_ema is not None
-        and slow_ema is not None
-        and fast_ema > slow_ema
-    )
-    ema_bearish = (
-        fast_ema is not None
-        and slow_ema is not None
-        and fast_ema < slow_ema
-    )
-
-    buy_ok = above_target
-    sell_ok = below_target
-
-    if REQUIRE_CANDLE_DIRECTION:
-        buy_ok = buy_ok and candle_green
-        sell_ok = sell_ok and candle_red
-
-    if REQUIRE_EMA_TREND:
-        buy_ok = buy_ok and ema_bullish
-        sell_ok = sell_ok and ema_bearish
-
-    if buy_ok:
-        return "BUY"
-
-    if sell_ok:
-        return "SELL"
-
-    return None
-
-
-# ── Main scanner ─────────────────────────────────────────────────────────────
+# ── Scanner ──────────────────────────────────────────────────────────────────
 
 def scan_once(state: dict) -> dict:
     now = utc_now()
-    window_start = fifteen_minute_window(now)
+    window_start = get_15m_window(now)
     window_key = window_start.isoformat()
 
     price = get_btc_price()
 
     if price is None:
-        state["last_radar_error"] = (
-            "Could not retrieve Coinbase BTC-USD price; retrying next scan."
-        )
-        state["status"] = "running"
+        state["last_radar_error"] = "Coinbase BTC-USD request failed; retrying next scan."
         save_state(state)
         return state
 
     state["last_price"] = price
     state["last_radar_error"] = None
 
-    # Start/reset a target when the next 15-minute window begins.
     if state.get("current_window_start") != window_key:
         state["current_window_start"] = window_key
         state["window_open_price"] = price
@@ -380,60 +539,60 @@ def scan_once(state: dict) -> dict:
         state["last_signal_window"] = None
 
         logger.info(
-            "New 15m window: open=%s target=%s",
-            format_usd(price),
-            format_usd(state["kalshi_target"]),
+            "New 15m window | Open=%s | Target=%s",
+            money(price),
+            money(state["kalshi_target"]),
         )
 
-    update_price_history(state, price)
+    prices = state.get("prices", [])
+    prices.append(price)
+    state["prices"] = prices[-MAX_PRICE_HISTORY:]
 
-    fast_ema = calculate_ema(state["ema_prices"], FAST_EMA_LENGTH)
-    slow_ema = calculate_ema(state["ema_prices"], SLOW_EMA_LENGTH)
-
-    target = float(state["kalshi_target"])
-    window_open_price = float(state["window_open_price"])
-
-    signal_type = determine_signal(
+    analysis = analyze(
         price=price,
-        target=target,
-        window_open_price=window_open_price,
-        fast_ema=fast_ema,
-        slow_ema=slow_ema,
+        prices=state["prices"],
+        target=float(state["kalshi_target"]),
     )
+
+    if analysis is None:
+        logger.info(
+            "Collecting price data: %s/%s samples.",
+            len(state["prices"]),
+            MIN_HISTORY_FOR_ALERTS,
+        )
+        save_state(state)
+        return state
+
+    signal_type = analysis["signal_type"]
 
     logger.info(
-        "BTC=%s | target=%s | EMA%s=%s | EMA%s=%s | signal=%s",
-        format_usd(price),
-        format_usd(target),
-        FAST_EMA_LENGTH,
-        format_usd(fast_ema),
-        SLOW_EMA_LENGTH,
-        format_usd(slow_ema),
-        signal_type or "NONE",
+        "BTC=%s | Signal=%s | Bull=%s Bear=%s | Confidence=%s%%",
+        money(price),
+        signal_type,
+        analysis["bullish"],
+        analysis["bearish"],
+        analysis["confidence"],
     )
 
-    # One alert maximum per signal type, per 15-minute window.
+    # Only UP or DOWN signals are sent. NEUTRAL produces no Discord message.
     already_sent = (
         state.get("last_signal") == signal_type
         and state.get("last_signal_window") == window_key
     )
 
-    if signal_type and not already_sent:
-        success, error = send_discord_alert(
-            signal_type=signal_type,
+    if signal_type in ("UP", "DOWN") and not already_sent:
+        success, error = send_discord_callout(
             price=price,
-            target=target,
+            target=float(state["kalshi_target"]),
+            analysis=analysis,
             window_start=window_start,
-            fast_ema=fast_ema,
-            slow_ema=slow_ema,
         )
 
         if success:
             state["last_signal"] = signal_type
             state["last_signal_window"] = window_key
             state["last_radar_sent_at"] = iso_now()
-            state["last_radar_error"] = None
-            logger.info("%s alert sent to Discord.", signal_type)
+            logger.info("%s callout sent to Discord.", signal_type)
         else:
             state["last_radar_error"] = f"Discord webhook failed: {error}"
             logger.error("Discord webhook failed: %s", error)
@@ -445,32 +604,30 @@ def scan_once(state: dict) -> dict:
 
 def stop_service(signum, frame) -> None:
     global RUNNING
-    logger.info("Shutdown signal received.")
     RUNNING = False
+    logger.info("Stopping BTC radar...")
 
 
 def main() -> None:
     if not DISCORD_WEBHOOK_URL:
         raise SystemExit(
-            "Missing DISCORD_WEBHOOK_URL.\n"
-            "Set it first, for example:\n"
-            'export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/ID/TOKEN"'
+            "DISCORD_WEBHOOK_URL is missing.\n"
+            "Set it before running the script."
         )
 
     signal.signal(signal.SIGINT, stop_service)
     signal.signal(signal.SIGTERM, stop_service)
 
-    logger.info("BTC Discord Radar started.")
-    logger.info("Source: Coinbase BTC-USD | Timeframe: 15m")
-    logger.info("Poll interval: %s seconds", POLL_SECONDS)
-
     state = load_state()
+
+    logger.info("PKLA BTC 15-minute radar started.")
+    logger.info("Polling Coinbase BTC-USD every %s seconds.", POLL_SECONDS)
 
     while RUNNING:
         try:
             state = scan_once(state)
         except Exception as error:
-            state["last_radar_error"] = f"Unexpected scanner error: {error}"
+            state["last_radar_error"] = f"Unexpected error: {error}"
             state["status"] = "running"
             save_state(state)
             logger.exception("Unexpected scanner error")
@@ -482,7 +639,7 @@ def main() -> None:
 
     state["status"] = "stopped"
     save_state(state)
-    logger.info("BTC Discord Radar stopped.")
+    logger.info("BTC radar stopped.")
 
 
 if __name__ == "__main__":
