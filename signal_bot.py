@@ -18,9 +18,11 @@ from flask import Flask, jsonify
 # =============================================================================
 # REDRUM BTC 15M RADAR
 #
-# TWO DISCORD CALLS PER 15-MINUTE MARKET:
-#   1) OPENING CALL  - after 60 seconds
-#   2) MIDPOINT CALL - when 7:30 remains
+# FOUR DISCORD CALLS PER 15-MINUTE MARKET:
+#   1) START    - after 60 seconds
+#   2) EARLY    - after 5 minutes
+#   3) MIDPOINT - when 7:30 remains
+#   4) END      - when 30 seconds remain
 #
 # EXCHANGE STATUS:
 #   🟩 UP
@@ -70,7 +72,10 @@ def health():
 def run_web_server():
     port = int(os.getenv("PORT", "10000"))
 
-    logger.info("Starting Render health server on port %s...", port)
+    logger.info(
+        "Starting Render health server on port %s...",
+        port,
+    )
 
     app.run(
         host="0.0.0.0",
@@ -82,26 +87,68 @@ def run_web_server():
 
 # ── Settings ─────────────────────────────────────────────────────────────────
 
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+DISCORD_WEBHOOK_URL = os.getenv(
+    "DISCORD_WEBHOOK_URL",
+    "",
+).strip()
 
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
-TIMEFRAME_MINUTES = 15
-TIMEFRAME_SECONDS = TIMEFRAME_MINUTES * 60
-
-OPEN_SCAN_DELAY_SECONDS = int(
-    os.getenv("OPEN_SCAN_DELAY_SECONDS", "60")
+POLL_SECONDS = int(
+    os.getenv(
+        "POLL_SECONDS",
+        "10",
+    )
 )
 
+TIMEFRAME_MINUTES = 15
+
+TIMEFRAME_SECONDS = (
+    TIMEFRAME_MINUTES * 60
+)
+
+# 1) START — 60 seconds after candle opens
+OPEN_SCAN_DELAY_SECONDS = int(
+    os.getenv(
+        "OPEN_SCAN_DELAY_SECONDS",
+        "60",
+    )
+)
+
+# 2) EARLY — 5 minutes after candle opens
+EARLY_SCAN_DELAY_SECONDS = int(
+    os.getenv(
+        "EARLY_SCAN_DELAY_SECONDS",
+        "300",
+    )
+)
+
+# 3) MIDPOINT — 7.5 minutes remaining
 MAIN_CALL_REMAINING_MINUTES = float(
-    os.getenv("MAIN_CALL_REMAINING_MINUTES", "7.5")
+    os.getenv(
+        "MAIN_CALL_REMAINING_MINUTES",
+        "7.5",
+    )
+)
+
+# 4) END — 30 seconds remaining
+END_CALL_REMAINING_SECONDS = int(
+    os.getenv(
+        "END_CALL_REMAINING_SECONDS",
+        "30",
+    )
 )
 
 MIN_MAIN_CONFIDENCE = int(
-    os.getenv("MIN_MAIN_CONFIDENCE", "65")
+    os.getenv(
+        "MIN_MAIN_CONFIDENCE",
+        "65",
+    )
 )
 
 MIN_ABS_MOVE_PCT = float(
-    os.getenv("MIN_ABS_MOVE_PCT", "0.015")
+    os.getenv(
+        "MIN_ABS_MOVE_PCT",
+        "0.015",
+    )
 )
 
 STATE_FILE = Path(
@@ -131,7 +178,11 @@ REQUIRED_NAMES = (
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(message)s"
+    ),
     handlers=[
         logging.StreamHandler(),
         logging.FileHandler(
@@ -149,6 +200,7 @@ logger = logging.getLogger(
 # ── HTTP retries ─────────────────────────────────────────────────────────────
 
 def build_session() -> requests.Session:
+
     retries = Retry(
         total=3,
         connect=3,
@@ -181,7 +233,9 @@ def build_session() -> requests.Session:
 
     session.headers.update(
         {
-            "User-Agent": "redrum-btc-radar/1.0",
+            "User-Agent": (
+                "redrum-btc-radar/1.1"
+            ),
             "Accept": "application/json",
             "Cache-Control": "no-cache",
         }
@@ -196,15 +250,23 @@ SESSION = build_session()
 # ── State ────────────────────────────────────────────────────────────────────
 
 def default_state() -> dict:
+
     return {
         "service": "redrum-btc-radar",
-        "version": "1.0",
-        "source": "Coinbase, Kraken, Bitstamp",
+        "version": "1.1",
+        "source": (
+            "Coinbase, Kraken, Bitstamp"
+        ),
         "status": "running",
         "timeframe": "15m",
         "active_window": None,
+
+        # Four Discord calls
         "open_scan_sent": False,
+        "early_scan_sent": False,
         "main_call_sent": False,
+        "end_call_sent": False,
+
         "opening_directions": {},
         "last_radar_error": None,
         "last_radar_sent_at": None,
@@ -213,10 +275,12 @@ def default_state() -> dict:
 
 
 def load_state() -> dict:
+
     if not STATE_FILE.exists():
         return default_state()
 
     try:
+
         state = default_state()
 
         state.update(
@@ -239,6 +303,7 @@ def load_state() -> dict:
         OSError,
         json.JSONDecodeError,
     ) as error:
+
         logger.warning(
             "Could not load state: %s",
             error,
@@ -247,8 +312,12 @@ def load_state() -> dict:
         return default_state()
 
 
-def save_state(state: dict) -> None:
+def save_state(
+    state: dict,
+) -> None:
+
     try:
+
         STATE_FILE.write_text(
             json.dumps(
                 state,
@@ -258,6 +327,7 @@ def save_state(state: dict) -> None:
         )
 
     except OSError as error:
+
         logger.error(
             "Could not save state: %s",
             error,
@@ -270,19 +340,28 @@ def reset_window_state(
 ) -> None:
 
     state["active_window"] = window_key
+
     state["open_scan_sent"] = False
+    state["early_scan_sent"] = False
     state["main_call_sent"] = False
+    state["end_call_sent"] = False
+
     state["opening_directions"] = {}
+
     state["samples"] = []
 
 
 # ── Time / display helpers ───────────────────────────────────────────────────
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+
+    return datetime.now(
+        timezone.utc
+    )
 
 
 def iso_now() -> str:
+
     return utc_now().isoformat()
 
 
@@ -290,7 +369,9 @@ def floor_15m_timestamp(
     now: datetime,
 ) -> int:
 
-    ts = int(now.timestamp())
+    ts = int(
+        now.timestamp()
+    )
 
     return ts - (
         ts % TIMEFRAME_SECONDS
@@ -439,8 +520,12 @@ def normalize_history(
 def get_coinbase_15m_history() -> Optional[dict]:
 
     try:
+
         response = SESSION.get(
-            "https://api.exchange.coinbase.com/products/BTC-USD/candles",
+            (
+                "https://api.exchange.coinbase.com/"
+                "products/BTC-USD/candles"
+            ),
             params={
                 "granularity": 900
             },
@@ -451,10 +536,10 @@ def get_coinbase_15m_history() -> Optional[dict]:
 
         rows = response.json()
 
-        if not isinstance(
-            rows,
-            list,
-        ) or not rows:
+        if (
+            not isinstance(rows, list)
+            or not rows
+        ):
 
             raise ValueError(
                 "Coinbase returned no candles."
@@ -480,7 +565,8 @@ def get_coinbase_15m_history() -> Optional[dict]:
         if not parsed:
 
             raise ValueError(
-                "Coinbase candle rows could not be parsed."
+                "Coinbase candle rows "
+                "could not be parsed."
             )
 
         return normalize_history(
@@ -506,6 +592,7 @@ def get_coinbase_15m_history() -> Optional[dict]:
 def get_kraken_15m_history() -> Optional[dict]:
 
     try:
+
         response = SESSION.get(
             "https://api.kraken.com/0/public/OHLC",
             params={
@@ -520,8 +607,11 @@ def get_kraken_15m_history() -> Optional[dict]:
         payload = response.json()
 
         if payload.get("error"):
+
             raise ValueError(
-                ", ".join(payload["error"])
+                ", ".join(
+                    payload["error"]
+                )
             )
 
         result = payload["result"]
@@ -543,7 +633,9 @@ def get_kraken_15m_history() -> Optional[dict]:
 
             parsed.append(
                 candle(
-                    ts=int(float(row[0])),
+                    ts=int(
+                        float(row[0])
+                    ),
                     open_=float(row[1]),
                     high=float(row[2]),
                     low=float(row[3]),
@@ -554,7 +646,8 @@ def get_kraken_15m_history() -> Optional[dict]:
         if not parsed:
 
             raise ValueError(
-                "Kraken returned no usable candles."
+                "Kraken returned no usable "
+                "candles."
             )
 
         return normalize_history(
@@ -582,8 +675,12 @@ def get_kraken_15m_history() -> Optional[dict]:
 def get_bitstamp_15m_history() -> Optional[dict]:
 
     try:
+
         response = SESSION.get(
-            "https://www.bitstamp.net/api/v2/ohlc/btcusd/",
+            (
+                "https://www.bitstamp.net/"
+                "api/v2/ohlc/btcusd/"
+            ),
             params={
                 "step": 900,
                 "limit": 80,
@@ -593,7 +690,11 @@ def get_bitstamp_15m_history() -> Optional[dict]:
 
         response.raise_for_status()
 
-        rows = response.json()["data"]["ohlc"]
+        rows = response.json()[
+            "data"
+        ][
+            "ohlc"
+        ]
 
         if not rows:
 
@@ -607,11 +708,21 @@ def get_bitstamp_15m_history() -> Optional[dict]:
 
             parsed.append(
                 candle(
-                    ts=int(row["timestamp"]),
-                    open_=float(row["open"]),
-                    high=float(row["high"]),
-                    low=float(row["low"]),
-                    close=float(row["close"]),
+                    ts=int(
+                        row["timestamp"]
+                    ),
+                    open_=float(
+                        row["open"]
+                    ),
+                    high=float(
+                        row["high"]
+                    ),
+                    low=float(
+                        row["low"]
+                    ),
+                    close=float(
+                        row["close"]
+                    ),
                 )
             )
 
@@ -682,6 +793,7 @@ def synchronize_current_markets(
         if history is None:
 
             missing.append(name)
+
             continue
 
         item = candle_map(
@@ -691,6 +803,7 @@ def synchronize_current_markets(
         if item is None:
 
             missing.append(name)
+
             continue
 
         selected.append(
@@ -710,7 +823,8 @@ def synchronized_closed_returns(
 ) -> list[dict]:
 
     by_name = {
-        history["name"]: candle_map(history)
+        history["name"]:
+        candle_map(history)
         for history in histories
     }
 
@@ -742,9 +856,12 @@ def synchronized_closed_returns(
             if item is None:
 
                 exchange_candles = []
+
                 break
 
-            exchange_candles.append(item)
+            exchange_candles.append(
+                item
+            )
 
         if len(exchange_candles) != len(
             REQUIRED_NAMES
@@ -781,8 +898,7 @@ def synchronized_closed_returns(
                 "change_pct": safe_div(
                     avg_close - avg_open,
                     avg_open,
-                )
-                * 100,
+                ) * 100,
             }
         )
 
@@ -805,9 +921,11 @@ def market_direction(
     )
 
     if market["close"] > market["open"]:
+
         return "UP", change_pct
 
     if market["close"] < market["open"]:
+
         return "DOWN", change_pct
 
     return "FLAT", change_pct
@@ -818,7 +936,8 @@ def consensus(
 ) -> tuple[str, int, int, int]:
 
     if (
-        len(markets) != len(REQUIRED_NAMES)
+        len(markets)
+        != len(REQUIRED_NAMES)
         or {
             m["name"]
             for m in markets
@@ -839,17 +958,20 @@ def consensus(
 
     for market in markets:
 
-        direction, _ = market_direction(
-            market
+        direction, _ = (
+            market_direction(market)
         )
 
         if direction == "UP":
+
             bullish += 1
 
         elif direction == "DOWN":
+
             bearish += 1
 
         else:
+
             flat += 1
 
     required = len(
@@ -1050,7 +1172,8 @@ def momentum_from_samples(
 
     prior = min(
         samples[:-1],
-        key=lambda sample: abs(
+        key=lambda sample:
+        abs(
             sample["ts"]
             - target_ts
         ),
@@ -1070,12 +1193,15 @@ def momentum_from_samples(
     )
 
     if delta > 0:
+
         direction = "UP"
 
     elif delta < 0:
+
         direction = "DOWN"
 
     else:
+
         direction = "FLAT"
 
     return {
@@ -1117,12 +1243,15 @@ def previous_trend(
     )
 
     if up_count > down_count:
+
         direction = "UP"
 
     elif down_count > up_count:
+
         direction = "DOWN"
 
     else:
+
         direction = "FLAT"
 
     directional_ratio = (
@@ -1384,33 +1513,43 @@ def model_metrics(
     directional_votes = 0
 
     if signal_type == "UP":
+
         directional_votes += 2
 
     elif signal_type == "DOWN":
+
         directional_votes -= 2
 
     if momentum["direction"] == "UP":
+
         directional_votes += 1
 
     elif momentum["direction"] == "DOWN":
+
         directional_votes -= 1
 
     if trend["direction"] == "UP":
+
         directional_votes += 1
 
     elif trend["direction"] == "DOWN":
+
         directional_votes -= 1
 
     if current["change_pct"] > 0.03:
+
         directional_votes += 1
 
     elif current["change_pct"] < -0.03:
+
         directional_votes -= 1
 
     if directional_votes >= 3:
+
         next_direction = "UP"
 
     elif directional_votes <= -3:
+
         next_direction = "DOWN"
 
     next_score = round(
@@ -1456,18 +1595,21 @@ def qualified_main_call(
         "UP",
         "DOWN",
     ):
+
         return "WAIT"
 
     if (
         metrics["confidence"]
         < MIN_MAIN_CONFIDENCE
     ):
+
         return "WAIT"
 
     if (
         abs(current["change_pct"])
         < MIN_ABS_MOVE_PCT
     ):
+
         return "WAIT"
 
     return strict_signal
@@ -1480,12 +1622,14 @@ def discord_style(
 ) -> tuple[str, int]:
 
     if direction == "UP":
+
         return (
             "🟢",
             0x2ECC71,
         )
 
     if direction == "DOWN":
+
         return (
             "🔴",
             0xE74C3C,
@@ -1507,10 +1651,16 @@ def exchange_status(
         market_direction(market)
     )
 
-    if stage == "MID":
+    if stage in (
+        "EARLY",
+        "MID",
+        "END",
+    ):
 
-        opening = opening_directions.get(
-            market["name"]
+        opening = (
+            opening_directions.get(
+                market["name"]
+            )
         )
 
         if (
@@ -1528,12 +1678,14 @@ def exchange_status(
             )
 
     if direction == "UP":
+
         return (
             "🟩",
             "UP",
         )
 
     if direction == "DOWN":
+
         return (
             "🟥",
             "DOWN",
@@ -1633,6 +1785,8 @@ def make_embed(
         current,
     )
 
+    # ── Stage-specific call display ──────────────────────────────────────────
+
     if stage == "OPEN":
 
         displayed_direction = (
@@ -1640,19 +1794,38 @@ def make_embed(
         )
 
         call_text = (
-            "OPENING CALL — HOLD"
+            "START CALL — HOLD"
             if displayed_direction
             == "NO TRADE"
             else
-            f"OPENING CALL — "
+            f"START CALL — "
             f"{displayed_direction}"
         )
 
         title_prefix = (
-            "OPENING CALL"
+            "START — CANDLE OPEN"
         )
 
-    else:
+    elif stage == "EARLY":
+
+        displayed_direction = (
+            metrics["strict_signal"]
+        )
+
+        call_text = (
+            "EARLY CALL — HOLD"
+            if displayed_direction
+            == "NO TRADE"
+            else
+            f"EARLY CALL — "
+            f"{displayed_direction}"
+        )
+
+        title_prefix = (
+            "EARLY — 5 MINUTES"
+        )
+
+    elif stage == "MID":
 
         displayed_direction = (
             main_call
@@ -1671,8 +1844,40 @@ def make_embed(
         )
 
         title_prefix = (
-            "MIDPOINT CALL"
+            "MIDPOINT — 7:30 LEFT"
         )
+
+    elif stage == "END":
+
+        displayed_direction = (
+            main_call
+            if main_call != "WAIT"
+            else
+            metrics["strict_signal"]
+        )
+
+        call_text = (
+            f"END CALL — "
+            f"{displayed_direction}"
+            if displayed_direction
+            in ("UP", "DOWN")
+            else
+            "END CALL — HOLD / WAIT"
+        )
+
+        title_prefix = (
+            "END — 30 SECONDS LEFT"
+        )
+
+    else:
+
+        displayed_direction = "WAIT"
+
+        call_text = (
+            "REDRUM — WAIT"
+        )
+
+        title_prefix = "STATUS"
 
     emoji, color = discord_style(
         displayed_direction
@@ -1707,6 +1912,7 @@ def make_embed(
         next_text = "WAIT"
 
     return {
+
         "title": (
             f"{emoji} REDRUM BTC 15M — "
             f"{title_prefix}"
@@ -1714,7 +1920,7 @@ def make_embed(
 
         "description": (
             f"**{call_text}**\n"
-            "Three-exchange synchronized "
+            "Four-stage synchronized "
             "BTC/USD radar"
         ),
 
@@ -1741,7 +1947,9 @@ def make_embed(
 
             {
                 "name": "📣 CURRENT CALL",
-                "value": f"**{call_text}**",
+                "value": (
+                    f"**{call_text}**"
+                ),
                 "inline": True,
             },
 
@@ -1910,6 +2118,8 @@ def scan_once(
         ).isoformat()
     )
 
+    # ── New candle ───────────────────────────────────────────────────────────
+
     if (
         state.get("active_window")
         != window_key
@@ -1919,6 +2129,13 @@ def scan_once(
             state,
             window_key,
         )
+
+        logger.info(
+            "New 15m candle detected: %s",
+            window_key,
+        )
+
+    # ── Get exchange histories ───────────────────────────────────────────────
 
     histories = (
         get_all_market_histories()
@@ -1971,6 +2188,8 @@ def scan_once(
 
         return state
 
+    # ── Current market calculations ──────────────────────────────────────────
+
     current = aggregate_current(
         markets
     )
@@ -2016,11 +2235,14 @@ def scan_once(
     state["last_radar_error"] = None
     state["status"] = "running"
 
-    # ── Opening call ──────────────────────────────────────────────────────────
+    # =========================================================================
+    # 1) START CALL — 60 seconds after candle opens
+    # =========================================================================
 
     if (
         not state.get(
-            "open_scan_sent"
+            "open_scan_sent",
+            False,
         )
         and elapsed
         >= OPEN_SCAN_DELAY_SECONDS
@@ -2045,6 +2267,8 @@ def scan_once(
                 "open_scan_sent"
             ] = True
 
+            # Capture the opening direction
+            # for GET OUT detection later.
             state[
                 "opening_directions"
             ] = {
@@ -2058,7 +2282,7 @@ def scan_once(
             ] = iso_now()
 
             logger.info(
-                "OPEN scan sent for %s",
+                "START call sent for %s",
                 window_key,
             )
 
@@ -2067,16 +2291,80 @@ def scan_once(
             state[
                 "last_radar_error"
             ] = (
-                "Discord OPEN failed: "
+                "Discord START failed: "
                 f"{error}"
             )
 
             logger.error(
-                "Discord OPEN failed: %s",
+                "Discord START failed: %s",
                 error,
             )
 
-    # ── Midpoint/main call ───────────────────────────────────────────────────
+    # =========================================================================
+    # 2) EARLY CALL — 5 minutes after candle opens
+    # =========================================================================
+
+    if (
+        not state.get(
+            "early_scan_sent",
+            False,
+        )
+        and elapsed
+        >= EARLY_SCAN_DELAY_SECONDS
+    ):
+
+        success, error = send_stage(
+            "EARLY",
+            window_ts,
+            remaining,
+            markets,
+            current,
+            metrics,
+            state.get(
+                "opening_directions",
+                {},
+            ),
+        )
+
+        if success:
+
+            state[
+                "early_scan_sent"
+            ] = True
+
+            state[
+                "last_radar_sent_at"
+            ] = iso_now()
+
+            logger.info(
+                "EARLY call sent for %s: "
+                "%s confidence=%s flip=%s",
+                window_key,
+                qualified_main_call(
+                    metrics,
+                    current,
+                ),
+                metrics["confidence"],
+                metrics["flip_risk"],
+            )
+
+        else:
+
+            state[
+                "last_radar_error"
+            ] = (
+                "Discord EARLY failed: "
+                f"{error}"
+            )
+
+            logger.error(
+                "Discord EARLY failed: %s",
+                error,
+            )
+
+    # =========================================================================
+    # 3) MIDPOINT CALL — 7:30 remaining
+    # =========================================================================
 
     main_threshold_seconds = (
         MAIN_CALL_REMAINING_MINUTES
@@ -2085,7 +2373,8 @@ def scan_once(
 
     if (
         not state.get(
-            "main_call_sent"
+            "main_call_sent",
+            False,
         )
         and remaining
         <= main_threshold_seconds
@@ -2115,7 +2404,7 @@ def scan_once(
             ] = iso_now()
 
             logger.info(
-                "MAIN call sent for %s: "
+                "MIDPOINT call sent for %s: "
                 "%s confidence=%s flip=%s",
                 window_key,
                 qualified_main_call(
@@ -2137,6 +2426,68 @@ def scan_once(
 
             logger.error(
                 "Discord MIDPOINT failed: %s",
+                error,
+            )
+
+    # =========================================================================
+    # 4) END CALL — 30 seconds remaining
+    # =========================================================================
+
+    if (
+        not state.get(
+            "end_call_sent",
+            False,
+        )
+        and remaining
+        <= END_CALL_REMAINING_SECONDS
+    ):
+
+        success, error = send_stage(
+            "END",
+            window_ts,
+            remaining,
+            markets,
+            current,
+            metrics,
+            state.get(
+                "opening_directions",
+                {},
+            ),
+        )
+
+        if success:
+
+            state[
+                "end_call_sent"
+            ] = True
+
+            state[
+                "last_radar_sent_at"
+            ] = iso_now()
+
+            logger.info(
+                "END call sent for %s: "
+                "%s confidence=%s flip=%s",
+                window_key,
+                qualified_main_call(
+                    metrics,
+                    current,
+                ),
+                metrics["confidence"],
+                metrics["flip_risk"],
+            )
+
+        else:
+
+            state[
+                "last_radar_error"
+            ] = (
+                "Discord END failed: "
+                f"{error}"
+            )
+
+            logger.error(
+                "Discord END failed: %s",
                 error,
             )
 
@@ -2192,10 +2543,15 @@ def main() -> None:
     )
 
     logger.info(
-        "Two calls only: OPEN after %ss | "
-        "MIDPOINT at <= %.1fm left",
+        "Four calls per candle: "
+        "START after %ss | "
+        "EARLY after %ss | "
+        "MIDPOINT at <= %.1fm left | "
+        "END at <= %ss remaining",
         OPEN_SCAN_DELAY_SECONDS,
+        EARLY_SCAN_DELAY_SECONDS,
         MAIN_CALL_REMAINING_MINUTES,
+        END_CALL_REMAINING_SECONDS,
     )
 
     logger.info(
@@ -2251,6 +2607,7 @@ def main() -> None:
         ):
 
             if not RUNNING:
+
                 break
 
             time.sleep(1)
@@ -2265,4 +2622,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+
     main()
